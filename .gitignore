@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+build/
+dist/
+output/
+*.egg-info/
+venv/
+.venv/
+Transcriber.exe
+Transcriber.spec
+icon.ico
+launcher.py
