@@ -1,0 +1,30 @@
+version: 2
+updates:
+  # Python pip dependencies
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: "America/La_Paz"
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    # Skip majors — those need manual review for breaking-change risk.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  # GitHub Actions (if/when added)
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: "America/La_Paz"
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - ci
