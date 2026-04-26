@@ -1,6 +1,6 @@
 PyQt6>=6.7
 pyaudiowpatch>=0.2.12
-faster-whisper>=1.1
+faster-whisper>=1.2.1
 numpy>=2.0
 nvidia-cublas-cu12
 nvidia-cudnn-cu12
