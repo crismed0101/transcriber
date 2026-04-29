@@ -2,12 +2,17 @@ import os
 import shutil
 import logging
 
+import paths
+
 log = logging.getLogger(__name__)
 
-OUTPUT_DIR = os.path.join(os.path.expanduser("~"), "Documents", "Transcriber")
+# ── Datos del usuario (carpeta segun modo portable o estandar) ──
+OUTPUT_DIR = paths.data_dir()
 
 # ── Whisper ──
-WHISPER_MODEL = "large-v3"
+# Modelo siempre el mas potente; sobreescribible via env var para testing.
+WHISPER_MODEL = os.environ.get("TRANSCRIBER_MODEL", "large-v3")
+
 
 def _detect_device():
     try:
@@ -19,10 +24,11 @@ def _detect_device():
     log.warning("CUDA no disponible, usando CPU (sera mas lento)")
     return "cpu", "int8"
 
+
 WHISPER_DEVICE, WHISPER_COMPUTE_TYPE = _detect_device()
 
-# ── FFmpeg ──
-FFMPEG_BIN = shutil.which("ffmpeg")
+# ── FFmpeg: bundled (modo portable) > sistema ──
+FFMPEG_BIN = paths.ffmpeg_path() or shutil.which("ffmpeg")
 
 # ── Idiomas ──
 LANGUAGES = {
@@ -37,5 +43,3 @@ LANGUAGES = {
 
 # ── Formatos de audio soportados ──
 AUDIO_FORMATS = "Archivos de audio (*.mp3 *.wav *.m4a *.ogg *.flac *.wma *.aac *.opus *.webm);;Todos (*)"
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)

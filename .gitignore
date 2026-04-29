@@ -1,12 +1,42 @@
+# Python
 __pycache__/
 *.pyc
-build/
-dist/
-output/
+*.pyo
 *.egg-info/
+.pytest_cache/
+
+# Entornos virtuales
 venv/
 .venv/
+env/
+
+# PyInstaller (output del build)
+build/
+dist/
+dist_*/
+
+# FFmpeg bundled (lo descarga build.py al empaquetar; no committearlo)
+bin/
+
+# Runtime / generado en ejecucion
+output/
+data/
+transcripciones/
+_sistema/
+models/
+settings.ini
+*.log
+
+# Build local de Windows (artefacto, no fuente)
 Transcriber.exe
-Transcriber.spec
-icon.ico
-launcher.py
+
+# IDE / herramientas
+.claude/
+.vscode/
+.idea/
+*.swp
+*.tmp
+
+# Sistema
+Thumbs.db
+.DS_Store
