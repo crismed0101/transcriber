@@ -10,6 +10,9 @@ log = logging.getLogger(__name__)
 SOURCE_LOOPBACK = "loopback"  # Audio del sistema (lo que sale por parlantes)
 SOURCE_MIC = "mic"            # Microfono
 
+# WAV usa headers de 32-bit -> limite real ~4 GB. Cortamos antes para evitar corrupcion.
+WAV_MAX_BYTES = int(3.8 * 1024 * 1024 * 1024)  # ~3.8 GB
+
 
 class AudioCapture:
     def __init__(self):
@@ -24,6 +27,11 @@ class AudioCapture:
         self._frames_count = 0
         self._paused = False
         self._disk_error = False
+        self._device_name = ""
+
+    @property
+    def device_name(self):
+        return self._device_name
 
     @property
     def available(self):
@@ -87,9 +95,15 @@ class AudioCapture:
         if not self._paused:
             with self._lock:
                 if self._wav_file:
+                    # Cortar antes del limite WAV de 4 GB para evitar corrupcion
+                    if self._bytes_written + len(in_data) >= WAV_MAX_BYTES:
+                        log.error("WAV alcanzo limite de %d bytes (~3.8 GB), deteniendo", WAV_MAX_BYTES)
+                        self._size_limit_hit = True
+                        return (None, pyaudio.paAbort)
                     try:
                         self._wav_file.writeframes(in_data)
                         self._frames_count += 1
+                        self._bytes_written += len(in_data)
                     except OSError as ex:
                         log.error("Error escribiendo audio (disco lleno?): %s", ex)
                         self._disk_error = True
@@ -116,9 +130,12 @@ class AudioCapture:
         self.is_recording = True
         self._paused = False
         self._frames_count = 0
+        self._bytes_written = 0
         self._device_channels = max(1, int(device.get("maxInputChannels", 1)))
         self._device_rate = int(device["defaultSampleRate"])
+        self._device_name = device["name"]
         self._disk_error = False
+        self._size_limit_hit = False
 
         log.info("Grabando (%s): %s (%d ch, %d Hz)",
                  source, device["name"], self._device_channels, self._device_rate)

@@ -111,6 +111,23 @@ class Transcriber:
         segments_data = []
         cancelled = False
 
+        def _format_partial():
+            """Texto con timestamps por linea, igual que el formato final."""
+            if not segments_data:
+                return ""
+            last_end = segments_data[-1]["end"]
+            use_hours = last_end >= 3600
+            lines = []
+            for s in segments_data:
+                t = max(0, int(s["start"]))
+                m, sec = divmod(t, 60)
+                h, m = divmod(m, 60)
+                ts = f"{h:02d}:{m:02d}:{sec:02d}" if use_hours else f"{m:02d}:{sec:02d}"
+                txt = s["text"].strip()
+                if txt:
+                    lines.append(f"[{ts}] {txt}")
+            return "\n".join(lines)
+
         for segment in segments_iter:
             if should_cancel and should_cancel():
                 cancelled = True
@@ -123,11 +140,11 @@ class Transcriber:
             })
             if on_progress and duration > 0:
                 pct = min(int(segment.end / duration * 100), 99)
-                on_progress(pct, " ".join(text_parts))
+                on_progress(pct, _format_partial())
 
         result_text = " ".join(text_parts)
         if on_progress and not cancelled:
-            on_progress(100, result_text)
+            on_progress(100, _format_partial())
 
         log.info(
             "Transcripcion: %d caracteres, idioma=%s prob=%.2f, cancelled=%s",

@@ -31,9 +31,11 @@ WHISPER_DEVICE, WHISPER_COMPUTE_TYPE = _detect_device()
 FFMPEG_BIN = paths.ffmpeg_path() or shutil.which("ffmpeg")
 
 # ── Idiomas ──
+# Español primero -> es el default visual + el mas usado.
+# Auto-detectar disponible pero NO default (se confunde es/pt en audios cortos).
 LANGUAGES = {
-    "Auto-detectar": None,
     "Español": "es",
+    "Auto-detectar": None,
     "English": "en",
     "Português": "pt",
     "Français": "fr",
