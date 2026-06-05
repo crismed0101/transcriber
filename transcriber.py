@@ -44,6 +44,28 @@ def build_srt(segments):
     return "\n".join(lines)
 
 
+def format_segments_with_timestamps(segments):
+    """Formato '[MM:SS] texto' por linea (HH:MM:SS si el audio supera 1h).
+
+    Unico lugar donde vive este formato: lo usan tanto el progreso parcial (aca)
+    como el resultado final (main.py). segments: lista de {start, end, text}.
+    """
+    if not segments:
+        return ""
+    last_end = max((s["end"] for s in segments), default=0)
+    use_hours = last_end >= 3600
+    lines = []
+    for s in segments:
+        t = max(0, int(s["start"]))
+        m, sec = divmod(t, 60)
+        h, m = divmod(m, 60)
+        ts = f"{h:02d}:{m:02d}:{sec:02d}" if use_hours else f"{m:02d}:{sec:02d}"
+        txt = s["text"].strip()
+        if txt:
+            lines.append(f"[{ts}] {txt}")
+    return "\n".join(lines)
+
+
 class Transcriber:
     def __init__(self, model_name=None, device=None, compute_type=None):
         self.model_name = model_name or WHISPER_MODEL
@@ -51,15 +73,6 @@ class Transcriber:
         self.compute_type = compute_type or WHISPER_COMPUTE_TYPE
         self.model = None
         self._load_lock = threading.Lock()
-
-    def needs_reload(self, model_name):
-        return model_name != self.model_name or self.model is None
-
-    def reset(self, model_name):
-        """Cambia el modelo a cargar la proxima vez (libera el actual)."""
-        with self._load_lock:
-            self.model_name = model_name
-            self.model = None
 
     def load_model(self):
         """Carga el modelo Whisper. Se descarga automaticamente la primera vez."""
@@ -97,7 +110,8 @@ class Transcriber:
             patience=2.0,
             repetition_penalty=1.1,
             no_repeat_ngram_size=3,
-            condition_on_previous_text=True,
+            condition_on_previous_text=False,
+            hallucination_silence_threshold=2.0,
             vad_filter=True,
             vad_parameters=dict(
                 threshold=0.35,
@@ -111,23 +125,6 @@ class Transcriber:
         segments_data = []
         cancelled = False
 
-        def _format_partial():
-            """Texto con timestamps por linea, igual que el formato final."""
-            if not segments_data:
-                return ""
-            last_end = segments_data[-1]["end"]
-            use_hours = last_end >= 3600
-            lines = []
-            for s in segments_data:
-                t = max(0, int(s["start"]))
-                m, sec = divmod(t, 60)
-                h, m = divmod(m, 60)
-                ts = f"{h:02d}:{m:02d}:{sec:02d}" if use_hours else f"{m:02d}:{sec:02d}"
-                txt = s["text"].strip()
-                if txt:
-                    lines.append(f"[{ts}] {txt}")
-            return "\n".join(lines)
-
         for segment in segments_iter:
             if should_cancel and should_cancel():
                 cancelled = True
@@ -140,11 +137,11 @@ class Transcriber:
             })
             if on_progress and duration > 0:
                 pct = min(int(segment.end / duration * 100), 99)
-                on_progress(pct, _format_partial())
+                on_progress(pct, format_segments_with_timestamps(segments_data))
 
         result_text = " ".join(text_parts)
         if on_progress and not cancelled:
-            on_progress(100, _format_partial())
+            on_progress(100, format_segments_with_timestamps(segments_data))
 
         log.info(
             "Transcripcion: %d caracteres, idioma=%s prob=%.2f, cancelled=%s",

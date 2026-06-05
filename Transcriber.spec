@@ -21,10 +21,15 @@ for pkg in ("faster_whisper", "ctranslate2", "pyaudiowpatch"):
     except Exception:
         pass
 
-# DLLs de NVIDIA (cublas, cudnn, cuda_nvrtc) — solo los que existen en venv
+# DLLs de NVIDIA (cublas, cudnn, cuda_nvrtc) — solo los que existen en venv.
+# CRITICO: destdir="ctranslate2" para que queden DENTRO de la carpeta de ctranslate2.
+# CTranslate2 (ver su __init__.py) solo hace os.add_dll_directory() sobre SU propia
+# carpeta y carga las *.dll que esten ahi. Si las DLLs de CUDA quedan en la ruta
+# anidada por defecto (nvidia/<pkg>/bin/), CTranslate2 NUNCA las encuentra y al
+# transcribir falla con "Library cublas64_12.dll is not found or cannot be loaded".
 for nv_pkg in ("nvidia.cublas", "nvidia.cudnn", "nvidia.cuda_nvrtc"):
     try:
-        binaries += collect_dynamic_libs(nv_pkg)
+        binaries += collect_dynamic_libs(nv_pkg, destdir="ctranslate2")
     except Exception:
         pass
 

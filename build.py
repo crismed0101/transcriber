@@ -21,10 +21,18 @@ import subprocess
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 SPEC = os.path.join(DIR, "Transcriber.spec")
+ISS = os.path.join(DIR, "Transcriber.iss")
 VENV_PY = os.path.join(DIR, "venv", "Scripts", "python.exe")
 BIN_DIR = os.path.join(DIR, "bin")
 
 FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+
+# Rutas tipicas donde queda ISCC.exe (compilador de Inno Setup) segun el tipo de install
+ISCC_CANDIDATES = [
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Inno Setup 6", "ISCC.exe"),
+    os.path.join(os.environ.get("ProgramFiles(x86)", ""), "Inno Setup 6", "ISCC.exe"),
+    os.path.join(os.environ.get("ProgramFiles", ""), "Inno Setup 6", "ISCC.exe"),
+]
 
 
 def log(msg):
@@ -73,6 +81,38 @@ def ensure_pyinstaller(python):
     if r.returncode != 0:
         log("Instalando pyinstaller ...")
         subprocess.run([python, "-m", "pip", "install", "--upgrade", "pyinstaller"], check=True)
+
+
+def find_iscc():
+    """Ubica ISCC.exe (compilador de Inno Setup). None si no esta instalado."""
+    for c in ISCC_CANDIDATES:
+        if c and os.path.exists(c):
+            return c
+    return None
+
+
+def build_installer():
+    """Compila installer/Transcriber-Setup.exe con Inno Setup a partir de dist/Transcriber/.
+
+    Requiere Inno Setup instalado (winget install JRSoftware.InnoSetup).
+    """
+    if not os.path.exists(ISS):
+        log(f"No existe {ISS}; salto el instalador")
+        return
+    iscc = find_iscc()
+    if not iscc:
+        log("Inno Setup (ISCC.exe) no encontrado. Instalalo con:")
+        log("    winget install JRSoftware.InnoSetup")
+        log("y volve a correr: python build.py --installer")
+        return
+    log(f"Compilando instalador con {iscc} ...")
+    subprocess.run([iscc, ISS], check=True, cwd=DIR)
+    out = os.path.join(DIR, "installer", "Transcriber-Setup.exe")
+    if os.path.exists(out):
+        size_mb = os.path.getsize(out) / 1024 / 1024
+        log(f"OK instalador -> {out} ({size_mb:.0f} MB)")
+    else:
+        log("WARN: ISCC corrio pero no se encontro Transcriber-Setup.exe")
 
 
 def main():
@@ -156,24 +196,23 @@ def main():
     if os.path.exists(src_readme):
         shutil.copy2(src_readme, readme_dst)
 
-    # Marker portable.txt: mientras exista, la app guarda todo junto al .exe.
-    # Si el usuario lo borra, la app se comporta como un programa normal Windows
-    # (Documents para transcripciones, %LOCALAPPDATA% para datos de la app).
-    portable_marker = os.path.join(dist_root, "portable.txt")
-    with open(portable_marker, "w", encoding="utf-8") as f:
-        f.write(
-            "Mientras este archivo exista, Transcriber corre en modo PORTABLE:\n"
-            "todos los datos (transcripciones, modelos, logs, settings) se guardan\n"
-            "junto a Transcriber.exe. Ideal para llevar la app en un USB.\n\n"
-            "Si BORRAS este archivo, la app pasa a modo ESTANDAR Windows:\n"
-            "  Transcripciones -> Documents\\Transcriber\\\n"
-            "  Modelos / logs  -> %LOCALAPPDATA%\\Transcriber\\\n"
-        )
-    log("portable.txt creado (modo portable activo por default)")
+    # NOTA: ya NO se crea portable.txt. La app corre siempre en modo estandar
+    # Windows en cualquier PC (decision de producto, ver paths.is_portable):
+    #   Transcripciones/audios -> Documents\Transcriber\
+    #   Modelos / logs         -> %LOCALAPPDATA%\Transcriber\
+    # Si quedara un portable.txt de un build viejo junto al .exe, la app lo ignora.
 
     log(f"OK -> {out_exe}")
-    log("Para distribuir: zipea la carpeta dist/Transcriber/ y compartila.")
-    log("Es portable: el usuario solo necesita extraerla y hacer doble click en Transcriber.exe.")
+
+    # Instalador opcional (Inno Setup): python build.py --installer
+    if "--installer" in args:
+        build_installer()
+        log("Para distribuir: comparti installer/Transcriber-Setup.exe (un solo archivo).")
+        log("El usuario lo ejecuta y la app se instala sola (accesos directos + desinstalador).")
+    else:
+        log("Para distribuir la carpeta: zipea dist/Transcriber/ y compartila.")
+        log("Para un instalador de un solo archivo: python build.py --installer")
+    log("Transcripciones -> Documents\\Transcriber\\ ; modelos/logs -> %LOCALAPPDATA%\\Transcriber\\")
 
 
 if __name__ == "__main__":

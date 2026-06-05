@@ -1,15 +1,13 @@
-"""Manejo de paths con dual-mode: portable o estandar Windows.
+"""Manejo de paths: SIEMPRE modo estandar Windows, en cualquier PC.
 
-Modo portable (PortableApps convention):
-  Activado si existe <app>/portable.txt junto al ejecutable.
-  Todos los datos viven al lado del .exe (USB-friendly, todo viaja junto).
-    data_dir   = <app>/transcripciones/
-    system_dir = <app>/_sistema/
+La app sigue las Known Folders de Microsoft, sin importar desde donde se ejecute
+(C:\\DevMed, USB, etc.). Es lo que el usuario espera: lo que el genera va a
+Documents, los datos internos de la app van al cache local del sistema.
+    data_dir   = ~/Documents/Transcriber/      (transcripciones + audios del usuario)
+    system_dir = %LOCALAPPDATA%/Transcriber/   (modelos, logs, settings)
 
-Modo estandar (Windows convention):
-  Default cuando no esta el marker. Sigue las Known Folders de Microsoft:
-    data_dir   = ~/Documents/Transcriber/      (transcripciones del usuario)
-    system_dir = %LOCALAPPDATA%/Transcriber/   (logs, settings, modelos)
+El antiguo modo portable (marker portable.txt junto al .exe) quedo DESACTIVADO;
+ver is_portable(). Si aparece un portable.txt de un build viejo, se ignora.
 
 Importar este modulo SETEA HF_HOME / HUGGINGFACE_HUB_CACHE para que faster_whisper
 descargue los modelos al directorio correcto. Debe importarse ANTES que faster_whisper.
@@ -32,8 +30,17 @@ def app_dir():
 
 
 def is_portable():
-    """Modo portable activo si existe <app>/portable.txt."""
-    return os.path.isfile(os.path.join(app_dir(), PORTABLE_MARKER))
+    """Modo portable DESACTIVADO por decision de producto.
+
+    Antes se activaba si existia <app>/portable.txt junto al .exe, lo que hacia
+    que la app guardara todo junto al ejecutable. Eso confundia al usuario porque
+    cada copia (C:\\DevMed, USB, etc.) escribia en su propia carpeta en vez de en
+    Documents. Ahora la app SIEMPRE usa rutas estandar Windows en cualquier PC:
+        transcripciones/audios -> ~/Documents/Transcriber/
+        modelos/logs/settings  -> %LOCALAPPDATA%/Transcriber/
+    El archivo portable.txt, si existe, se ignora.
+    """
+    return False
 
 
 def data_dir():
@@ -87,7 +94,7 @@ def log_path():
 
 
 # ── Side effect: setear cache HF antes que faster_whisper se importe ──
+# (TRANSFORMERS_CACHE quedo deprecado en huggingface_hub; HF_HOME ya cubre todo.)
 _models = models_dir()
 os.environ.setdefault("HF_HOME", _models)
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", _models)
-os.environ.setdefault("TRANSFORMERS_CACHE", _models)

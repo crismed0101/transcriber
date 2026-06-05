@@ -3,17 +3,15 @@ import shutil
 import logging
 
 import paths
+import hardware
 
 log = logging.getLogger(__name__)
 
-# ── Datos del usuario (carpeta segun modo portable o estandar) ──
+# ── Datos del usuario (siempre Documents/Transcriber, ver paths.data_dir) ──
 OUTPUT_DIR = paths.data_dir()
 
-# ── Whisper ──
-# Modelo siempre el mas potente; sobreescribible via env var para testing.
-WHISPER_MODEL = os.environ.get("TRANSCRIBER_MODEL", "large-v3")
 
-
+# ── Whisper: device (GPU si hay CUDA, sino CPU) ──
 def _detect_device():
     try:
         import ctranslate2
@@ -27,7 +25,30 @@ def _detect_device():
 
 WHISPER_DEVICE, WHISPER_COMPUTE_TYPE = _detect_device()
 
-# ── FFmpeg: bundled (modo portable) > sistema ──
+
+# ── Whisper: modelo auto-seleccionado segun el hardware de ESTA PC ──
+# La app elige el mejor modelo que entra en la GPU/CPU detectada (ver hardware.recommend_model):
+#   GPU grande -> large-v3 ; GPU mediana/chica -> medium/small/base ; sin GPU -> small/base/tiny.
+# Asi funciona bien en cualquier PC sin quedarse sin memoria. Se puede forzar uno fijo
+# con la variable de entorno TRANSCRIBER_MODEL (util para testing/debug).
+# Reusa el device ya detectado para no consultar CUDA dos veces al arranque.
+def _select_model():
+    override = os.environ.get("TRANSCRIBER_MODEL")
+    if override:
+        log.info("Modelo forzado via TRANSCRIBER_MODEL=%s", override)
+        return override
+    try:
+        m = hardware.recommend_model(cuda=(WHISPER_DEVICE == "cuda"))
+        log.info("Modelo auto-seleccionado segun hardware: %s", m)
+        return m
+    except Exception:
+        log.warning("No se pudo auto-seleccionar modelo; uso large-v3 por defecto", exc_info=True)
+        return "large-v3"
+
+
+WHISPER_MODEL = _select_model()
+
+# ── FFmpeg: bundled (al lado del .exe) > sistema (PATH) ──
 FFMPEG_BIN = paths.ffmpeg_path() or shutil.which("ffmpeg")
 
 # ── Idiomas ──

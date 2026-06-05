@@ -15,7 +15,8 @@ from utils import same_path
 log = logging.getLogger(__name__)
 
 _OLD_SESSION_RE = re.compile(r"^(archivo|grabacion)_(\d{4})(\d{2})(\d{2})_\d{6}$")
-_TRANSCRIPCION_RE = re.compile(r"^transcripcion-(\d+)$")
+# Acepta 'transcripcion-N' y 'transcripcion-N (nombre custom)' (grupo 1 = el numero).
+_TRANSCRIPCION_RE = re.compile(r"^transcripcion-(\d+)( \(.+\))?$")
 
 
 # ── Pre-migracion: log/settings ANTES de abrir el FileHandler ──

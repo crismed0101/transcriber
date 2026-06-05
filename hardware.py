@@ -74,6 +74,10 @@ def recommend_model(vram_gb=None, ram_gb=None, cuda=None):
     cuda = has_cuda() if cuda is None else cuda
     if cuda:
         vram_gb = total_vram_gb() if vram_gb is None else vram_gb
+        if vram_gb <= 0:
+            # CUDA disponible pero no pudimos medir la VRAM (nvidia-smi ausente/timeout).
+            # Confiamos en el GPU y usamos el modelo grande (no degradar a ciegas).
+            return "large-v3"
         if vram_gb >= 5:
             return "large-v3"
         if vram_gb >= 3:

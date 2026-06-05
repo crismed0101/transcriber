@@ -30,6 +30,13 @@ settings.ini
 # Build local de Windows (artefacto, no fuente)
 Transcriber.exe
 
+# Instalador (pesa ~1.5 GB; va como Release de GitHub, NO dentro del repo)
+installer/
+Transcriber-Setup.exe
+
+# Metadatos de Windows (alternate data streams visibles desde WSL)
+*:Zone.Identifier
+
 # IDE / herramientas
 .claude/
 .vscode/
