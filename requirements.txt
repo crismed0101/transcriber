@@ -1,5 +1,5 @@
 PyQt6>=6.7
-pyaudiowpatch>=0.2.12
+pyaudiowpatch>=0.2.12.8
 faster-whisper>=1.1
 ctranslate2          # motor ASR (dep de faster-whisper; explicito para reproducibilidad)
 numpy>=2.0
