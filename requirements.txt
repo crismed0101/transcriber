@@ -2,7 +2,7 @@ PyQt6>=6.7
 pyaudiowpatch>=0.2.12
 faster-whisper>=1.1
 ctranslate2          # motor ASR (dep de faster-whisper; explicito para reproducibilidad)
-numpy>=2.0
+numpy>=2.4.6
 nvidia-cublas-cu12
 nvidia-cudnn-cu12
 nvidia-cuda-nvrtc-cu12
