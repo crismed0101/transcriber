@@ -1,4 +1,4 @@
-PyQt6>=6.7
+PyQt6>=6.11.0
 pyaudiowpatch>=0.2.12
 faster-whisper>=1.1
 ctranslate2          # motor ASR (dep de faster-whisper; explicito para reproducibilidad)
