@@ -26,7 +26,7 @@ Para instalar sin asistente (útil en varias PC) o una versión concreta:
 
 ```powershell
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/crismed0101/transcriber/master/install.ps1))) -Silent
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/crismed0101/transcriber/master/install.ps1))) -Version v1.1.0
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/crismed0101/transcriber/master/install.ps1))) -Version v1.2.0
 ```
 
 > Windows advierte que el editor es desconocido porque el binario no está firmado:

@@ -1,16 +1,23 @@
-# Transcriber v1.1.0
+# Transcriber v1.2.0
 
 Versión de corrección profunda. Se arreglaron fallos que hacían perder trabajo sin
 avisar, y ahora la app se adapta sola al equipo en vez de fallar cuando la
 configuración elegida no sirve.
 
-**Actualizar es recomendado para todos.** Si venís de 1.0.x, el instalador migra tus
-transcripciones automáticamente (ver "Tus archivos se movieron solos").
+**Actualizar es recomendado para todos**, vengas de la versión que vengas. El
+instalador migra tus transcripciones automáticamente (ver "Tus archivos se movieron
+solos"), y a partir de esta versión la app avisa sola cuando hay una nueva.
 
-## Descarga
+## Instalación
 
-Bajá `Transcriber-Setup-v1.1.0-windows-x64.exe` y ejecutalo. Instala por usuario, sin
-pedir permisos de administrador.
+Un solo comando en PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/crismed0101/transcriber/master/install.ps1 | iex
+```
+
+O bajá el `.exe` de abajo y hacé doble clic. Instala por usuario, sin pedir permisos de
+administrador.
 
 > Windows puede advertir "Windows protegió su PC" porque la app no está firmada
 > digitalmente: **Más información** → **Ejecutar de todas formas**.
@@ -71,6 +78,19 @@ podía transcribir.
 
 También detecta si tu placa NVIDIA necesita un driver más nuevo y te lo explica, en
 vez de fallar más adelante con un mensaje incomprensible.
+
+## Nuevo: se actualiza sola
+
+De acá en adelante no hace falta volver a instalar a mano. La app consulta una vez por
+día si hay versión nueva y te avisa, con tres opciones: **Actualizar**, **Ahora no** u
+**Omitir esta versión**.
+
+Si aceptás, descarga el instalador mostrando el progreso, **verifica que el archivo no
+venga alterado** comparando su firma SHA256, y recién ahí lo ejecuta. Si la verificación
+falla, borra el archivo y no instala nada.
+
+Nunca interrumpe: si estás grabando o transcribiendo, el aviso espera. También podés
+buscar actualizaciones cuando quieras desde el menú del icono de la bandeja.
 
 ## Otras mejoras
 

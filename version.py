@@ -12,7 +12,7 @@ Consumidores:
 Para liberar una version: cambiar __version__ ACA Y SOLO ACA.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 APP_NAME = "Transcriber"
 APP_PUBLISHER = "CrisMed"

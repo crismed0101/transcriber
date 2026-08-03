@@ -12,7 +12,7 @@
     Instala sin mostrar el asistente (util para instalar en varias PC).
 
 .PARAMETER Version
-    Instala una version concreta (por ejemplo "v1.1.0") en vez de la ultima.
+    Instala una version concreta (por ejemplo "v1.2.0") en vez de la ultima.
 #>
 [CmdletBinding()]
 param(
