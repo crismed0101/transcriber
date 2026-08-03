@@ -2,7 +2,10 @@
 import os
 import re
 import sys
+import logging
 import subprocess
+
+log = logging.getLogger(__name__)
 
 # Evita que subprocess abra ventanas de consola cuando la app corre sin consola.
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -35,6 +38,19 @@ def resource_path(rel):
 def same_path(a, b):
     """Compara rutas normalizadas y sin distinguir mayusculas (correcto en Windows)."""
     return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+
+
+def open_in_explorer(path):
+    """Abre una carpeta o archivo con la aplicacion asociada del sistema.
+
+    Se abre la carpeta directamente y no `explorer /select`, que falla cuando el
+    nombre tiene espacios o parentesis (p.ej. 'transcripcion-3 (prueba)') y termina
+    abriendo la carpeta raiz.
+    """
+    try:
+        os.startfile(path)
+    except (OSError, AttributeError) as ex:
+        log.warning("No se pudo abrir %s: %s", path, ex)
 
 
 def sanitize_folder_name(name, max_len=60):

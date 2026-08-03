@@ -20,8 +20,3 @@ os.environ["HF_HOME"] = os.path.join(_SANDBOX, "hf")
 os.environ["HUGGINGFACE_HUB_CACHE"] = os.path.join(_SANDBOX, "hf")
 
 atexit.register(shutil.rmtree, _SANDBOX, ignore_errors=True)
-
-
-def sandbox():
-    """Directorio temporal que hace de HOME durante las pruebas."""
-    return _SANDBOX

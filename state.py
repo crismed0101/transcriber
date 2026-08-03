@@ -14,9 +14,17 @@ from utils import same_path
 
 log = logging.getLogger(__name__)
 
+# ── Layout de las carpetas de trabajo ──
+# Definido aca porque este modulo es el dueno del layout en disco: quien lo lee
+# (el historial, por ejemplo) reusa estas expresiones en vez de repetirlas.
 _OLD_SESSION_RE = re.compile(r"^(archivo|grabacion)_(\d{4})(\d{2})(\d{2})_\d{6}$")
-# Acepta 'transcripcion-N' y 'transcripcion-N (nombre custom)'; grupo 1 = numero.
-_TRANSCRIPCION_RE = re.compile(r"^transcripcion-(\d+)( \(.+\))?$")
+
+#: Carpeta de un dia: 2026-08-03
+DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+#: Carpeta de una sesion. Acepta 'transcripcion-N' y 'transcripcion-N (nombre)';
+#: el grupo 1 es el numero.
+SESSION_RE = re.compile(r"^transcripcion-(\d+)( \(.+\))?$")
 
 # Nombres que deja la app dentro de una sesion y que valen la pena conservar.
 SESSION_KEEP_FILES = frozenset({"audio.mp3", "transcripcion.txt", "transcripcion.srt"})
@@ -67,7 +75,7 @@ def next_session_number(day_dir):
     except OSError:
         return n
     for entry in entries:
-        m = _TRANSCRIPCION_RE.match(entry)
+        m = SESSION_RE.match(entry)
         if m and os.path.isdir(os.path.join(day_dir, entry)):
             n = max(n, int(m.group(1)) + 1)
     return n
