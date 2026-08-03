@@ -39,22 +39,33 @@ Guía de uso: `USER_README.txt` (se instala junto a la app como `LEEME.txt`).
 
 ### Publicar una versión
 
+**No hace falta compilar en ninguna computadora.** Lo hace GitHub:
+
+1. Cambiar `__version__` en `version.py` (única fuente de verdad) y subirlo.
+2. Pestaña **Actions** → **Publicar version** → **Run workflow**.
+3. A los ~30 minutos el instalador aparece en
+   [Releases](https://github.com/crismed0101/transcriber/releases).
+
+También se dispara solo al empujar una etiqueta `v*`.
+
+El workflow (`.github/workflows/release.yml`) corre sobre `windows-latest` e invoca el
+mismo `build.py` que se usa localmente. En una sola pasada: corre las pruebas, compila,
+verifica que no falte ninguna biblioteca, arma el instalador, ejecuta el `--selftest`
+sobre el binario congelado y recién entonces publica. Si algo de eso falla, no se
+publica nada.
+
+Las copias ya instaladas detectan la versión nueva y se actualizan solas.
+
+Para compilar en tu propia máquina (útil para probar antes de publicar):
+
 ```cmd
-venv\Scripts\python build.py --clean --publish --strict --lock
-```
-
-`--publish` compila el instalador, genera su SHA256 y crea el release en GitHub con `gh`.
-Toma la descripción de `.github/release-notes-v<version>.md` si existe.
-
-Antes de publicar conviene verificar el binario:
-
-```cmd
+venv\Scripts\python build.py --clean --installer --strict --lock
 dist\Transcriber\Transcriber.exe --selftest
 ```
 
-Para liberar una versión: cambiar `__version__` en `version.py` (única fuente de verdad)
-y correr el comando de arriba. Las copias ya instaladas detectan la versión nueva y se
-actualizan solas.
+> El workflow corre en máquinas **sin placa NVIDIA**: puede verificar que el ejecutable
+> esté completo, pero no que la transcripción por GPU funcione. Eso se confirma al
+> instalarlo, mirando que el recuadro diga "GPU" y no "CPU (lento)".
 
 El `.sha256` es lo que verifican tanto `install.ps1` como el actualizador de la app antes
 de ejecutar nada: como el binario no está firmado, es la única garantía de integridad

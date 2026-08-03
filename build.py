@@ -41,6 +41,9 @@ LOCK_FILE = os.path.join(DIR, "requirements.lock.txt")
 
 FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 
+# Tamano maximo por archivo adjunto a un release de GitHub.
+GITHUB_ASSET_LIMIT = 2 * 1024 ** 3
+
 # Rutas tipicas de ISCC.exe (compilador de Inno Setup) segun el tipo de instalacion.
 ISCC_CANDIDATES = (
     os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Inno Setup 6", "ISCC.exe"),
@@ -282,23 +285,101 @@ def build_installer(dist_root, started_at, strict):
     write_checksum(out)
 
 
-def publish(started_at, strict):
+def run_selftest(dist_root):
+    """Corre el autodiagnostico del ejecutable recien compilado.
+
+    Es la unica prueba que ejercita el binario congelado: import perezoso de
+    onnxruntime para el VAD, las DLL de FFmpeg de PyAV y los assets del modelo de
+    voz. Un build puede terminar sin errores y fallar en cualquiera de esas tres.
+    """
+    exe = os.path.join(dist_root, f"{version.APP_NAME}.exe")
+    log("Verificando el ejecutable (--selftest) ...")
+    result = subprocess.run([exe, "--selftest"], cwd=DIR)
+    if result.returncode == 0:
+        log("OK el ejecutable funciona")
+        return
+
+    # Sin consola, el informe solo existe en el archivo.
+    try:
+        import paths
+
+        with open(paths.selftest_log_path(), encoding="utf-8") as f:
+            for line in f:
+                log("  " + line.rstrip())
+    except (ImportError, OSError):
+        pass
+    raise BuildError("El ejecutable no paso la verificacion; no se publica nada.")
+
+
+def check_publishable(path):
+    """Aborta si el archivo no se va a poder subir a un release de GitHub."""
+    size = os.path.getsize(path)
+    if size > GITHUB_ASSET_LIMIT:
+        raise BuildError(
+            f"{os.path.basename(path)} pesa {size / 1024 ** 3:.2f} GiB y GitHub no "
+            f"acepta archivos de mas de {GITHUB_ASSET_LIMIT / 1024 ** 3:.0f} GiB por "
+            "release. Hay que reducir el instalador antes de publicar."
+        )
+    log(f"Tamano OK: {size / 1024 ** 3:.2f} GiB "
+        f"(limite {GITHUB_ASSET_LIMIT / 1024 ** 3:.0f} GiB)")
+
+
+def check_gh_auth():
+    """Confirma que `gh` pueda publicar.
+
+    Local: se resuelve con `gh auth login`. En GitHub Actions: con la variable
+    GH_TOKEN. Chequear la autenticacion real cubre los dos casos; mirar solo la
+    variable daria un falso negativo en una PC ya autenticada.
+    """
+    try:
+        result = subprocess.run(["gh", "auth", "status"],
+                                capture_output=True, text=True)
+    except FileNotFoundError as ex:
+        raise BuildError(
+            "No se encontro `gh`. Instalalo con:  winget install GitHub.cli"
+        ) from ex
+    if result.returncode != 0:
+        raise BuildError(
+            "`gh` no esta autenticado y no se puede publicar.\n"
+            "  En tu PC:            gh auth login\n"
+            "  En GitHub Actions:   pasar GH_TOKEN al paso que corre build.py"
+        )
+
+
+def publish(started_at, dist_root, strict):
     """Publica el instalador y su checksum como un release de GitHub.
 
     El codigo fuente no se adjunta: el repositorio es publico, asi que GitHub ya
     genera los archivos de fuente de cada tag y eso cubre la obligacion de la GPL
     que arrastra PyQt6.
     """
+    check_gh_auth()
+    run_selftest(dist_root)
+
     installer = os.path.join(
         INSTALLER_DIR, f"{version.APP_NAME}-Setup-v{version.__version__}-windows-x64.exe"
     )
     assert_fresh(installer, started_at, "el instalador")
+    check_publishable(installer)
 
     checksum = installer + ".sha256"
     if not os.path.exists(checksum):
         warn(f"falta {checksum}; el instalador se publicaria sin verificacion", strict)
 
     tag = f"v{version.__version__}"
+
+    # Avisar antes de compilar el error de `gh`: es el tropiezo mas probable, porque
+    # olvidarse de subir la version es facil.
+    existing = subprocess.run(
+        ["gh", "release", "view", tag, "-R", version.RELEASES_REPO],
+        capture_output=True, text=True,
+    )
+    if existing.returncode == 0:
+        raise BuildError(
+            f"La version {tag} ya esta publicada en {version.RELEASES_REPO}.\n"
+            "  Subi __version__ en version.py y volve a intentar."
+        )
+
     notes = os.path.join(DIR, ".github", f"release-notes-{tag}.md")
     assets = [p for p in (installer, checksum) if os.path.exists(p)]
 
@@ -400,16 +481,17 @@ def main(argv=None):
     else:
         log("Para un instalador de un solo archivo: python build.py --installer")
 
-    log("Antes de distribuir, verifica el binario:")
-    log(f"    {exe} --selftest")
-
     if args.publish:
-        publish(started_at, args.strict)
-        log(f"Tus colegas ya pueden instalar con:")
-        log(f"    irm https://raw.githubusercontent.com/{version.RELEASES_REPO}"
-            "/main/install.ps1 | iex")
-    elif args.installer:
-        log("Para publicarlo en GitHub: python build.py --publish")
+        # publish() corre el --selftest antes de subir nada: asi una sola pasada
+        # compila, verifica y publica, sin rehacer el ejecutable dos veces.
+        publish(started_at, dist_root, args.strict)
+        log("Ya se puede descargar e instalar desde:")
+        log(f"    https://github.com/{version.RELEASES_REPO}/releases/latest")
+    else:
+        log("Antes de distribuir, verifica el binario:")
+        log(f"    {exe} --selftest")
+        if args.installer:
+            log("Para publicarlo en GitHub: python build.py --publish")
     return 0
 
 

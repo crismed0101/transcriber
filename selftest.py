@@ -123,7 +123,7 @@ def run():
     # console=False significa que no hay stdout util en el .exe: el informe va a
     # un archivo y el resultado se comunica por codigo de salida.
     try:
-        log_file = os.path.join(paths.system_dir(), "selftest.log")
+        log_file = paths.selftest_log_path()
         with open(log_file, "w", encoding="utf-8") as f:
             f.write(text + "\n")
     except OSError:

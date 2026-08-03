@@ -1,0 +1,115 @@
+# Compila el instalador de Windows y lo publica como release.
+#
+# Se dispara a mano desde la pestana Actions (boton "Run workflow") o al empujar una
+# etiqueta v*. La idea es que sacar una version no obligue a instalar herramientas de
+# desarrollo en ninguna computadora.
+#
+# Toda la logica vive en build.py, que es el mismo que se usa localmente: aca solo se
+# prepara la maquina y se lo invoca.
+name: Publicar version
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write        # necesario para crear el release
+
+concurrency:
+  group: release
+  cancel-in-progress: false   # nunca cortar una publicacion a medio camino
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Descargar el codigo
+        uses: actions/checkout@v7
+
+      # La imagen trae ~14 GB de disco y el build necesita cerca de 10 (dependencias
+      # ~2,9 GB, salida de PyInstaller ~3,1 GB, temporales, instalador ~1,5 GB).
+      # Entra, pero sin margen: se borran SDKs preinstalados que este proyecto no usa.
+      - name: Hacer lugar en el disco
+        shell: pwsh
+        run: |
+          $antes = (Get-PSDrive C).Free / 1GB
+          $borrar = @(
+            'C:\Android',
+            'C:\Program Files (x86)\Android',
+            'C:\Program Files\dotnet\sdk',
+            'C:\Program Files\MongoDB',
+            'C:\Program Files\PostgreSQL',
+            'C:\Program Files (x86)\Microsoft SDKs\Azure',
+            "$env:AGENT_TOOLSDIRECTORY\CodeQL",
+            "$env:AGENT_TOOLSDIRECTORY\Ruby",
+            "$env:AGENT_TOOLSDIRECTORY\go"
+          )
+          foreach ($ruta in $borrar) {
+            if (Test-Path $ruta) {
+              Remove-Item $ruta -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+          $despues = (Get-PSDrive C).Free / 1GB
+          Write-Host ("Libre: {0:N1} GB -> {1:N1} GB" -f $antes, $despues)
+
+      - name: Preparar Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # --no-cache-dir es importante: las bibliotecas de NVIDIA pesan ~1,3 GB y sin
+      # esto quedan duplicadas en el cache de pip, que aca no sirve para nada.
+      - name: Instalar dependencias
+        shell: pwsh
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: |
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir -r requirements.txt
+
+      - name: Correr las pruebas
+        shell: pwsh
+        run: python -m unittest discover -s tests -t . --verbose
+
+      - name: Mostrar la version a publicar
+        id: version
+        shell: pwsh
+        run: |
+          $v = python -c "import version; print(version.__version__)"
+          Write-Host "Publicando Transcriber v$v"
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      # build.py hace todo en una sola pasada: compila, verifica que no falte ninguna
+      # biblioteca, arma el instalador, corre el --selftest sobre el ejecutable y
+      # recien entonces publica. --strict convierte en error cualquier degradacion
+      # silenciosa.
+      - name: Compilar y publicar
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python build.py --clean --publish --strict
+
+      # Queda disponible para descargar desde la corrida aunque el release falle.
+      - name: Guardar el instalador
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: Transcriber-${{ steps.version.outputs.version }}
+          path: |
+            installer/*.exe
+            installer/*.sha256
+          compression-level: 0    # el instalador ya viene comprimido con LZMA2
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Informe del autodiagnostico si algo fallo
+        if: failure()
+        shell: pwsh
+        run: |
+          $informe = "$env:LOCALAPPDATA\Transcriber\selftest.log"
+          if (Test-Path $informe) { Get-Content $informe }
+          else { Write-Host "No hay informe de autodiagnostico." }

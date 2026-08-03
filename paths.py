@@ -155,6 +155,15 @@ def log_path():
     return os.path.join(system_dir(), "transcriber.log")
 
 
+def selftest_log_path():
+    """Informe de `Transcriber.exe --selftest`.
+
+    Como la app se compila sin consola, el autodiagnostico no puede escribir en
+    pantalla: deja el detalle aca y comunica el resultado por codigo de salida.
+    """
+    return os.path.join(system_dir(), "selftest.log")
+
+
 # ── Side effect: fijar el cache de HuggingFace antes de que se importe faster_whisper ──
 # Sin esto los modelos caerian en ~/.cache/huggingface, fuera del control de la app.
 _models = models_dir()
