@@ -18,12 +18,11 @@ APP_NAME = "Transcriber"
 APP_PUBLISHER = "CrisMed"
 APP_URL = "https://github.com/crismed0101/transcriber"
 
-# Repositorio PUBLICO desde donde se publican y descargan los instaladores.
-# Esta separado del repositorio del codigo (privado) a proposito: la app consulta
-# esta API para buscar actualizaciones, y hacerlo contra un repositorio privado
-# exigiria llevar un token de GitHub dentro del ejecutable, que es lo mismo que
-# publicarlo.
-RELEASES_REPO = "crismed0101/transcriber-releases"
+# Repositorio de donde se descargan los instaladores y donde el actualizador
+# consulta si hay version nueva. Tiene que ser PUBLICO: si fuera privado, la app
+# necesitaria llevar un token de GitHub adentro, y un token dentro de un binario
+# que se reparte no es secreto.
+RELEASES_REPO = "crismed0101/transcriber"
 RELEASES_URL = f"https://github.com/{RELEASES_REPO}/releases"
 INSTALLER_LATEST_URL = f"{RELEASES_URL}/latest/download/{APP_NAME}-Setup.exe"
 APP_DESCRIPTION = "Transcripcion de audio a texto con Whisper (offline, local)"

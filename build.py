@@ -282,32 +282,13 @@ def build_installer(dist_root, started_at, strict):
     write_checksum(out)
 
 
-def make_source_archive(dest_dir):
-    """Genera un zip del codigo fuente para adjuntar al release.
-
-    PyQt6 es GPL: quien recibe el binario tiene derecho al codigo. Publicar el zip
-    junto al instalador satisface esa obligacion sin abrir el repositorio.
-
-    Usa `git archive`, asi que incluye exactamente lo versionado (respeta
-    .gitignore) y no arrastra venv/, dist/ ni bin/.
-    """
-    out = os.path.join(dest_dir, f"{version.APP_NAME}-v{version.__version__}-source.zip")
-    try:
-        subprocess.run(
-            ["git", "archive", "--format=zip", "-o", out, "HEAD"],
-            check=True, cwd=DIR,
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError) as ex:
-        raise BuildError(
-            f"No se pudo generar el zip del codigo ({ex}). Hace falta git y que el "
-            "proyecto sea un repositorio."
-        ) from ex
-    log(f"OK codigo fuente -> {out} ({os.path.getsize(out) / 1024 / 1024:.1f} MB)")
-    return out
-
-
 def publish(started_at, strict):
-    """Sube el instalador, su checksum y el codigo al repositorio de releases."""
+    """Publica el instalador y su checksum como un release de GitHub.
+
+    El codigo fuente no se adjunta: el repositorio es publico, asi que GitHub ya
+    genera los archivos de fuente de cada tag y eso cubre la obligacion de la GPL
+    que arrastra PyQt6.
+    """
     installer = os.path.join(
         INSTALLER_DIR, f"{version.APP_NAME}-Setup-v{version.__version__}-windows-x64.exe"
     )
@@ -317,11 +298,9 @@ def publish(started_at, strict):
     if not os.path.exists(checksum):
         warn(f"falta {checksum}; el instalador se publicaria sin verificacion", strict)
 
-    source_zip = make_source_archive(INSTALLER_DIR)
-
     tag = f"v{version.__version__}"
     notes = os.path.join(DIR, ".github", f"release-notes-{tag}.md")
-    assets = [p for p in (installer, checksum, source_zip) if os.path.exists(p)]
+    assets = [p for p in (installer, checksum) if os.path.exists(p)]
 
     cmd = ["gh", "release", "create", tag, *assets,
            "-R", version.RELEASES_REPO, "--title", f"{version.APP_NAME} {tag}"]

@@ -13,24 +13,27 @@ App de escritorio Windows para transcribir audio a texto con Whisper, sin conexi
 Un solo comando en PowerShell, en cualquier Windows 10/11 de 64 bits:
 
 ```powershell
-irm https://raw.githubusercontent.com/crismed0101/transcriber/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/crismed0101/transcriber/master/install.ps1 | iex
 ```
 
 Descarga la última versión publicada, verifica su SHA256 y la instala por usuario, sin
-pedir permisos de administrador.
+pedir permisos de administrador. No hace falta tener Python ni nada instalado.
 
-Para instalar sin asistente (varias PC) o una versión concreta:
+Alternativa sin comandos: descargar el `.exe` desde
+[Releases](https://github.com/crismed0101/transcriber/releases/latest) y hacer doble clic.
+
+Para instalar sin asistente (útil en varias PC) o una versión concreta:
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/crismed0101/transcriber/main/install.ps1))) -Silent
-& ([scriptblock]::Create((irm .../install.ps1))) -Version v1.1.0
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/crismed0101/transcriber/master/install.ps1))) -Silent
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/crismed0101/transcriber/master/install.ps1))) -Version v1.1.0
 ```
 
-> Requiere que el repositorio y sus releases sean **públicos**. Si es privado, hay que
-> exportar un token antes: `$env:GITHUB_TOKEN = "ghp_..."`.
+> Windows advierte que el editor es desconocido porque el binario no está firmado:
+> **Más información** → **Ejecutar de todas formas**.
 
-Alternativa manual: descargar `Transcriber-Setup-vX.Y.Z-windows-x64.exe` desde
-[Releases](https://github.com/crismed0101/transcriber/releases) y ejecutarlo.
+Una vez instalada, la app avisa sola cuando hay versión nueva y se actualiza desde el
+mismo lugar.
 
 Guía de uso: `USER_README.txt` (se instala junto a la app como `LEEME.txt`).
 
@@ -40,9 +43,8 @@ Guía de uso: `USER_README.txt` (se instala junto a la app como `LEEME.txt`).
 venv\Scripts\python build.py --clean --publish --strict --lock
 ```
 
-`--publish` compila el instalador, genera su SHA256, empaqueta el código con
-`git archive` y sube los tres archivos al repositorio de instaladores con `gh`. Toma la
-descripción de `.github/release-notes-v<version>.md` si existe.
+`--publish` compila el instalador, genera su SHA256 y crea el release en GitHub con `gh`.
+Toma la descripción de `.github/release-notes-v<version>.md` si existe.
 
 Antes de publicar conviene verificar el binario:
 
@@ -51,26 +53,16 @@ dist\Transcriber\Transcriber.exe --selftest
 ```
 
 Para liberar una versión: cambiar `__version__` en `version.py` (única fuente de verdad)
-y correr el comando de arriba.
-
-### Por qué dos repositorios
-
-| Repositorio | Visibilidad | Contenido |
-|---|---|---|
-| `transcriber` | privado | El código. |
-| `transcriber-releases` | público | Solo instaladores, checksums y el zip del código. |
-
-La app consulta la API de releases para buscar actualizaciones. Hacerlo contra un
-repositorio privado exigiría llevar un token de GitHub dentro del ejecutable, y un token
-dentro de un binario que se reparte no es secreto. Separando ambos, el código sigue
-privado y la actualización automática funciona sin credenciales.
-
-El zip del código va en cada release porque PyQt6 es GPL: quien recibe el binario tiene
-derecho al fuente. No obliga a abrir el repositorio ni su historial.
+y correr el comando de arriba. Las copias ya instaladas detectan la versión nueva y se
+actualizan solas.
 
 El `.sha256` es lo que verifican tanto `install.ps1` como el actualizador de la app antes
 de ejecutar nada: como el binario no está firmado, es la única garantía de integridad
 disponible.
+
+El repositorio es público, lo cual además cubre la obligación de la GPL que arrastra
+PyQt6: quien recibe el binario tiene derecho al código, y GitHub adjunta el fuente de
+cada tag automáticamente.
 
 ## Para desarrolladores
 

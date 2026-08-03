@@ -6,10 +6,7 @@
     Descarga el instalador mas reciente, verifica su integridad y lo ejecuta.
     Pensado para invocarse en una sola linea:
 
-        irm https://raw.githubusercontent.com/crismed0101/transcriber-releases/main/install.ps1 | iex
-
-    Consulta el repositorio PUBLICO de instaladores, que esta separado del
-    repositorio del codigo (privado). Por eso no hacen falta credenciales.
+        irm https://raw.githubusercontent.com/crismed0101/transcriber/master/install.ps1 | iex
 
 .PARAMETER Silent
     Instala sin mostrar el asistente (util para instalar en varias PC).
@@ -24,7 +21,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Repo = "crismed0101/transcriber-releases"
+$Repo = "crismed0101/transcriber"
 $AppName = "Transcriber"
 
 function Write-Paso  { param($m) Write-Host "==> $m" -ForegroundColor Cyan }
