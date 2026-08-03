@@ -37,14 +37,40 @@ Guía de uso: `USER_README.txt` (se instala junto a la app como `LEEME.txt`).
 ### Publicar una versión
 
 ```cmd
-venv\Scripts\python build.py --clean --installer --strict --lock
-dist\Transcriber\Transcriber.exe --selftest
-gh release create v1.1.0 installer\*.exe installer\*.sha256 ^
-   --notes-file .github\release-notes-v1.1.0.md
+venv\Scripts\python build.py --clean --publish --strict --lock
 ```
 
-El `.sha256` es lo que `install.ps1` verifica antes de ejecutar el instalador: como el
-binario no está firmado, es la única garantía de integridad que se puede ofrecer.
+`--publish` compila el instalador, genera su SHA256, empaqueta el código con
+`git archive` y sube los tres archivos al repositorio de instaladores con `gh`. Toma la
+descripción de `.github/release-notes-v<version>.md` si existe.
+
+Antes de publicar conviene verificar el binario:
+
+```cmd
+dist\Transcriber\Transcriber.exe --selftest
+```
+
+Para liberar una versión: cambiar `__version__` en `version.py` (única fuente de verdad)
+y correr el comando de arriba.
+
+### Por qué dos repositorios
+
+| Repositorio | Visibilidad | Contenido |
+|---|---|---|
+| `transcriber` | privado | El código. |
+| `transcriber-releases` | público | Solo instaladores, checksums y el zip del código. |
+
+La app consulta la API de releases para buscar actualizaciones. Hacerlo contra un
+repositorio privado exigiría llevar un token de GitHub dentro del ejecutable, y un token
+dentro de un binario que se reparte no es secreto. Separando ambos, el código sigue
+privado y la actualización automática funciona sin credenciales.
+
+El zip del código va en cada release porque PyQt6 es GPL: quien recibe el binario tiene
+derecho al fuente. No obliga a abrir el repositorio ni su historial.
+
+El `.sha256` es lo que verifican tanto `install.ps1` como el actualizador de la app antes
+de ejecutar nada: como el binario no está firmado, es la única garantía de integridad
+disponible.
 
 ## Para desarrolladores
 

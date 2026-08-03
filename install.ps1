@@ -6,12 +6,10 @@
     Descarga el instalador mas reciente, verifica su integridad y lo ejecuta.
     Pensado para invocarse en una sola linea:
 
-        irm https://raw.githubusercontent.com/crismed0101/transcriber/main/install.ps1 | iex
+        irm https://raw.githubusercontent.com/crismed0101/transcriber-releases/main/install.ps1 | iex
 
-    Requiere que el repositorio y sus releases sean publicos. Si el repositorio es
-    privado, hay que exportar un token antes de ejecutar:
-
-        $env:GITHUB_TOKEN = "ghp_..."
+    Consulta el repositorio PUBLICO de instaladores, que esta separado del
+    repositorio del codigo (privado). Por eso no hacen falta credenciales.
 
 .PARAMETER Silent
     Instala sin mostrar el asistente (util para instalar en varias PC).
@@ -26,7 +24,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Repo = "crismed0101/transcriber"
+$Repo = "crismed0101/transcriber-releases"
 $AppName = "Transcriber"
 
 function Write-Paso  { param($m) Write-Host "==> $m" -ForegroundColor Cyan }
@@ -50,7 +48,6 @@ Write-Ok "Windows $([Environment]::OSVersion.Version.Major) de 64 bits"
 Write-Paso "Buscando la ultima version publicada"
 
 $headers = @{ "User-Agent" = "$AppName-installer"; "Accept" = "application/vnd.github+json" }
-if ($env:GITHUB_TOKEN) { $headers["Authorization"] = "Bearer $env:GITHUB_TOKEN" }
 
 $apiUrl = if ($Version -eq "latest") {
     "https://api.github.com/repos/$Repo/releases/latest"
@@ -62,8 +59,7 @@ try {
     $release = Invoke-RestMethod -Uri $apiUrl -Headers $headers
 } catch {
     if ($_.Exception.Response.StatusCode.value__ -eq 404) {
-        throw ("No se encontro el release. Si el repositorio es privado, " +
-               'defini un token antes de ejecutar:  $env:GITHUB_TOKEN = "ghp_..."')
+        throw "Todavia no hay ninguna version publicada en $Repo."
     }
     throw "No se pudo consultar GitHub: $($_.Exception.Message)"
 }

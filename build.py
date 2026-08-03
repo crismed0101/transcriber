@@ -282,6 +282,65 @@ def build_installer(dist_root, started_at, strict):
     write_checksum(out)
 
 
+def make_source_archive(dest_dir):
+    """Genera un zip del codigo fuente para adjuntar al release.
+
+    PyQt6 es GPL: quien recibe el binario tiene derecho al codigo. Publicar el zip
+    junto al instalador satisface esa obligacion sin abrir el repositorio.
+
+    Usa `git archive`, asi que incluye exactamente lo versionado (respeta
+    .gitignore) y no arrastra venv/, dist/ ni bin/.
+    """
+    out = os.path.join(dest_dir, f"{version.APP_NAME}-v{version.__version__}-source.zip")
+    try:
+        subprocess.run(
+            ["git", "archive", "--format=zip", "-o", out, "HEAD"],
+            check=True, cwd=DIR,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError) as ex:
+        raise BuildError(
+            f"No se pudo generar el zip del codigo ({ex}). Hace falta git y que el "
+            "proyecto sea un repositorio."
+        ) from ex
+    log(f"OK codigo fuente -> {out} ({os.path.getsize(out) / 1024 / 1024:.1f} MB)")
+    return out
+
+
+def publish(started_at, strict):
+    """Sube el instalador, su checksum y el codigo al repositorio de releases."""
+    installer = os.path.join(
+        INSTALLER_DIR, f"{version.APP_NAME}-Setup-v{version.__version__}-windows-x64.exe"
+    )
+    assert_fresh(installer, started_at, "el instalador")
+
+    checksum = installer + ".sha256"
+    if not os.path.exists(checksum):
+        warn(f"falta {checksum}; el instalador se publicaria sin verificacion", strict)
+
+    source_zip = make_source_archive(INSTALLER_DIR)
+
+    tag = f"v{version.__version__}"
+    notes = os.path.join(DIR, ".github", f"release-notes-{tag}.md")
+    assets = [p for p in (installer, checksum, source_zip) if os.path.exists(p)]
+
+    cmd = ["gh", "release", "create", tag, *assets,
+           "-R", version.RELEASES_REPO, "--title", f"{version.APP_NAME} {tag}"]
+    if os.path.exists(notes):
+        cmd += ["--notes-file", notes]
+    else:
+        warn(f"no existe {notes}; el release saldra sin descripcion", strict)
+        cmd += ["--notes", f"{version.APP_NAME} {tag}"]
+
+    log(f"Publicando {tag} en {version.RELEASES_REPO} ...")
+    try:
+        subprocess.run(cmd, check=True, cwd=DIR)
+    except FileNotFoundError as ex:
+        raise BuildError(
+            "No se encontro `gh`. Instalalo con:  winget install GitHub.cli"
+        ) from ex
+    log(f"OK publicado -> {version.RELEASES_URL}/tag/{tag}")
+
+
 def write_checksum(path):
     """Escribe <archivo>.sha256 junto al instalador.
 
@@ -309,6 +368,8 @@ def parse_args(argv):
     p.add_argument("--skip-ffmpeg", action="store_true", help="no descarga FFmpeg")
     p.add_argument("--lock", action="store_true",
                    help="escribe requirements.lock.txt con el entorno actual")
+    p.add_argument("--publish", action="store_true",
+                   help="publica el release en el repositorio de instaladores (implica --installer)")
     return p.parse_args(argv)
 
 
@@ -355,14 +416,21 @@ def main(argv=None):
     verify_artifacts(dist_root, args.strict)
     log(f"OK -> {exe}")
 
-    if args.installer:
+    if args.installer or args.publish:
         build_installer(dist_root, started_at, args.strict)
-        log("Para distribuir: comparti installer/*.exe (un solo archivo).")
     else:
         log("Para un instalador de un solo archivo: python build.py --installer")
 
     log("Antes de distribuir, verifica el binario:")
     log(f"    {exe} --selftest")
+
+    if args.publish:
+        publish(started_at, args.strict)
+        log(f"Tus colegas ya pueden instalar con:")
+        log(f"    irm https://raw.githubusercontent.com/{version.RELEASES_REPO}"
+            "/main/install.ps1 | iex")
+    elif args.installer:
+        log("Para publicarlo en GitHub: python build.py --publish")
     return 0
 
 

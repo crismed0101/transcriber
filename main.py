@@ -152,6 +152,7 @@ if sys.platform == "win32" and not paths.is_frozen():
 
 import config
 import hardware
+import updater
 from config import OUTPUT_DIR, LANGUAGES, FFMPEG_BIN, AUDIO_FORMATS, AUDIO_EXTS
 from audio_capture import AudioCapture, SOURCE_LOOPBACK, SOURCE_MIC
 from transcriber import Transcriber, EngineCancelled, is_model_downloaded
@@ -376,6 +377,43 @@ class ModelLoadThread(QThread):
         except Exception as ex:
             log.error("Error cargando el motor Whisper", exc_info=True)
             self.done.emit(str(ex))
+
+
+class UpdateCheckThread(QThread):
+    """Consulta si hay version nueva, sin bloquear la interfaz."""
+    found = pyqtSignal(object)   # UpdateInfo, o None si no hay novedades
+
+    def run(self):
+        # check_for_update no lanza: cualquier problema de red devuelve None.
+        self.found.emit(updater.check_for_update())
+
+
+class UpdateDownloadThread(QThread):
+    """Descarga y verifica el instalador de una version nueva."""
+    progress = pyqtSignal(int, int)   # bytes descargados, bytes totales
+    done = pyqtSignal(str, str)       # ruta, mensaje de error ("" si todo bien)
+
+    def __init__(self, info):
+        super().__init__()
+        self.info = info
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            path = updater.download_installer(
+                self.info,
+                on_progress=lambda done, total: self.progress.emit(done, total),
+                should_cancel=lambda: self._cancelled,
+            )
+            self.done.emit(path, "")
+        except updater.UpdateCancelled:
+            self.done.emit("", "cancelado")
+        except Exception as ex:
+            log.error("Error descargando la actualizacion", exc_info=True)
+            self.done.emit("", str(ex))
 
 
 class _BaseTranscribeThread(QThread):
@@ -856,6 +894,9 @@ class TranscriberApp(QMainWindow):
         self._process_thread = None
         self._file_thread = None
         self._load_thread = None
+        self._update_check_thread = None
+        self._update_download_thread = None
+        self._manual_update_check = False
         self._download_timer = None
         self._download_dir = None
         self._download_target_mb = 0
@@ -872,6 +913,8 @@ class TranscriberApp(QMainWindow):
         self._check_dependencies()
         self._start_engine_load()
         QTimer.singleShot(800, self._maybe_warn_cpu)
+        # Unos segundos despues, para no competir con la carga del modelo.
+        QTimer.singleShot(6000, self._check_updates_if_due)
 
     # ── Persistencia ──
     def _restore_settings(self):
@@ -1251,6 +1294,10 @@ class TranscriberApp(QMainWindow):
 
         menu.addSeparator()
 
+        updates_action = QAction("Buscar actualizaciones", self)
+        updates_action.triggered.connect(self.check_updates_now)
+        menu.addAction(updates_action)
+
         about_action = QAction("Acerca de...", self)
         about_action.triggered.connect(self._show_about)
         menu.addAction(about_action)
@@ -1354,6 +1401,146 @@ class TranscriberApp(QMainWindow):
             )
         QMessageBox.warning(self, title, msg)
         self.settings.setValue(config.SETTING_CPU_WARNING_SHOWN, True)
+
+    # ── Actualizaciones ──
+    def _check_updates_if_due(self):
+        """Comprobacion automatica, como mucho una vez por dia."""
+        last = self.settings.value(config.SETTING_LAST_UPDATE_CHECK, "", type=str)
+        if last:
+            try:
+                elapsed = datetime.datetime.now() - datetime.datetime.fromisoformat(last)
+                if elapsed.total_seconds() < config.UPDATE_CHECK_INTERVAL_HOURS * 3600:
+                    return
+            except ValueError:
+                pass  # valor corrupto: se vuelve a comprobar
+        self._start_update_check(manual=False)
+
+    def check_updates_now(self):
+        """Comprobacion manual desde el menu de la bandeja."""
+        self._start_update_check(manual=True)
+
+    def _start_update_check(self, manual):
+        if self._update_check_thread is not None or self._update_download_thread is not None:
+            return
+        self._manual_update_check = manual
+        if manual:
+            self._set_status("Buscando actualizaciones...")
+        self._update_check_thread = UpdateCheckThread()
+        self._update_check_thread.found.connect(self._on_update_found)
+        self._update_check_thread.finished.connect(self._on_update_check_done)
+        self._update_check_thread.start()
+
+    def _on_update_check_done(self):
+        self._update_check_thread = None
+
+    def _on_update_found(self, info):
+        self.settings.setValue(
+            config.SETTING_LAST_UPDATE_CHECK,
+            datetime.datetime.now().isoformat(timespec="seconds"),
+        )
+        if info is None:
+            if self._manual_update_check:
+                self._set_status("Listo")
+                QMessageBox.information(
+                    self, "Sin novedades",
+                    f"Ya tenes la ultima version ({version.__version__}).",
+                )
+            return
+
+        skipped = self.settings.value(config.SETTING_SKIPPED_VERSION, "", type=str)
+        if not self._manual_update_check and info.version == skipped:
+            log.info("La version %s fue omitida por el usuario", info.version)
+            return
+        self._prompt_update(info)
+
+    def _prompt_update(self, info):
+        """Ofrece actualizar. No interrumpe una grabacion ni una transcripcion."""
+        if self.is_recording or self.is_processing:
+            QTimer.singleShot(120_000, lambda: self._prompt_update(info))
+            return
+        self._set_status("Listo")
+
+        notes = info.notes
+        if len(notes) > 600:
+            notes = notes[:600].rsplit("\n", 1)[0] + "\n..."
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("Hay una version nueva")
+        box.setText(
+            f"<b>{version.APP_NAME} {info.version}</b> ya esta disponible.<br>"
+            f"Tenes instalada la {version.__version__}."
+        )
+        if notes:
+            box.setInformativeText(notes)
+        if info.size:
+            box.setDetailedText(
+                f"Se descargaran {info.size / 1024 / 1024:.0f} MB desde:\n{info.installer_url}"
+            )
+        update_btn = box.addButton("Actualizar", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Ahora no", QMessageBox.ButtonRole.RejectRole)
+        skip_btn = box.addButton("Omitir esta version", QMessageBox.ButtonRole.DestructiveRole)
+        box.setDefaultButton(update_btn)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is update_btn:
+            self._start_update_download(info)
+        elif clicked is skip_btn:
+            self.settings.setValue(config.SETTING_SKIPPED_VERSION, info.version)
+            log.info("El usuario omitio la version %s", info.version)
+
+    def _start_update_download(self, info):
+        self._set_status("Descargando actualizacion...")
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.show()
+        self.cancel_btn.show()
+
+        self._update_download_thread = UpdateDownloadThread(info)
+        self._update_download_thread.progress.connect(self._on_update_progress)
+        self._update_download_thread.done.connect(self._on_update_downloaded)
+        self._update_download_thread.finished.connect(self._on_update_download_done)
+        self._update_download_thread.start()
+        self._refresh_controls()
+
+    def _on_update_progress(self, downloaded, total):
+        mb = downloaded / 1024 / 1024
+        if total > 0:
+            self.progress_bar.setValue(int(downloaded / total * 100))
+            self.progress_bar.setFormat(f"{mb:.0f} / {total / 1024 / 1024:.0f} MB")
+        else:
+            self.progress_bar.setFormat(f"{mb:.0f} MB")
+
+    def _on_update_download_done(self):
+        self._update_download_thread = None
+        self._refresh_controls()
+
+    def _on_update_downloaded(self, path, error):
+        self.progress_bar.hide()
+        self.progress_bar.setFormat("%p%")
+        self.cancel_btn.hide()
+
+        if error == "cancelado":
+            self._set_status("Actualizacion cancelada")
+            return
+        if error:
+            self._set_status("No se pudo actualizar", error=True)
+            QMessageBox.warning(
+                self, "No se pudo actualizar",
+                f"{error}\n\nPodes descargarla a mano desde:\n{version.RELEASES_URL}",
+            )
+            return
+
+        QMessageBox.information(
+            self, "Listo para instalar",
+            f"{version.APP_NAME} se va a cerrar para instalar la version nueva.\n\n"
+            "Cuando el instalador termine, la app se abre de nuevo.",
+        )
+        updater.launch_installer(path)
+        self._quit_requested = True
+        self.close()
 
     # ── Carga del motor ──
     def _start_engine_load(self):
@@ -1480,7 +1667,10 @@ class TranscriberApp(QMainWindow):
 
     def _refresh_controls(self):
         """Unico lugar que decide si los controles principales estan habilitados."""
-        busy = self.is_recording or self.is_processing
+        # Descargar una actualizacion tambien bloquea: la app se va a cerrar al
+        # terminar, asi que no conviene dejar empezar una grabacion.
+        busy = (self.is_recording or self.is_processing
+                or self._update_download_thread is not None)
         loading = self._load_thread is not None
         can_record = not busy and self.audio.available and bool(FFMPEG_BIN)
         can_upload = not busy and bool(FFMPEG_BIN)
@@ -1984,7 +2174,8 @@ class TranscriberApp(QMainWindow):
     def _on_cancel(self):
         """Aborta la operacion en curso (cooperativo)."""
         cancelled = False
-        for thread in (self._process_thread, self._file_thread, self._load_thread):
+        for thread in (self._process_thread, self._file_thread, self._load_thread,
+                       self._update_download_thread):
             if thread is not None and thread.isRunning():
                 thread.cancel()
                 cancelled = True
@@ -2246,7 +2437,8 @@ class TranscriberApp(QMainWindow):
         if self._download_timer is not None:
             self._download_timer.stop()
 
-        threads = (self._process_thread, self._file_thread, self._load_thread)
+        threads = (self._process_thread, self._file_thread, self._load_thread,
+                   self._update_check_thread, self._update_download_thread)
 
         # 1) Pedir el aborto cooperativo y desconectar las senales: una senal en
         #    vuelo que llegue a un widget ya destruido revienta con
@@ -2258,7 +2450,9 @@ class TranscriberApp(QMainWindow):
                 thread.disconnect()
             except (RuntimeError, TypeError):
                 pass
-            if thread.isRunning():
+            # UpdateCheckThread no es cancelable: es una sola peticion con timeout
+            # corto, asi que termina sola.
+            if thread.isRunning() and hasattr(thread, "cancel"):
                 thread.cancel()
 
         # 2) Esperar. Si un hilo no responde (descarga de varios GB sin puntos de
