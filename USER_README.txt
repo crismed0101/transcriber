@@ -45,17 +45,39 @@ ELEGIR EL MODELO
 ----------------
 El desplegable "Modelo" define la calidad:
 
-   Automatico  elige el mejor que tu equipo aguanta (recomendado)
-   tiny        ~75 MB    el mas rapido, calidad basica
-   base        ~145 MB   rapido, calidad aceptable
-   small       ~480 MB   equilibrado
-   medium      ~1.5 GB   mejor calidad, necesita placa NVIDIA
-   large-v3    ~3 GB     la mejor calidad, necesita placa NVIDIA
+   Automatico        elige el mejor que tu equipo aguanta (recomendado)
+   tiny              ~75 MB    el mas rapido, calidad basica
+   base              ~145 MB   rapido, calidad aceptable
+   small             ~480 MB   equilibrado
+   medium            ~1.5 GB   bueno, necesita placa NVIDIA
+   large-v3-turbo    ~1.6 GB   casi la calidad de large-v3 y mucho
+                               mas rapido; ideal para audios largos
+   large-v3          ~3 GB     la mejor calidad, necesita placa NVIDIA
 
 Si elegis uno que no entra en la memoria de tu equipo, la app
 baja sola al siguiente que si entra: no se rompe ni se cuelga.
 Cambiar de modelo recarga el motor y puede descargar archivos
 nuevos la primera vez.
+
+
+VOCABULARIO Y ESTILO
+--------------------
+Click derecho en el icono de la bandeja > "Vocabulario y
+estilo...".
+
+Ahi hay un texto que el modelo usa como ejemplo: imita su
+puntuacion, sus acentos y su forma de escribir. Sirve sobre
+todo para nombres propios, siglas y jerga.
+
+Por ejemplo, si tus audios hablan de una empresa o de terminos
+tecnicos que la app escribe mal, agregalos ahi:
+
+   Transcripcion en español, con puntuacion, acentos y
+   mayusculas correctas. Terminos: Kubernetes, PostgreSQL,
+   Dr. Martinez, ACME S.R.L.
+
+Con eso deja de escribirlos mal. Si lo dejas vacio, no se usa
+ninguno.
 
 
 VELOCIDAD

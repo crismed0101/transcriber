@@ -155,7 +155,10 @@ import hardware
 import updater
 from config import OUTPUT_DIR, LANGUAGES, FFMPEG_BIN, AUDIO_FORMATS, AUDIO_EXTS
 from audio_capture import AudioCapture, SOURCE_LOOPBACK, SOURCE_MIC
-from transcriber import Transcriber, EngineCancelled, is_model_downloaded
+from transcriber import (
+    Transcriber, EngineCancelled, is_model_downloaded, model_cache_dir,
+    DEFAULT_INITIAL_PROMPT,
+)
 from subtitles import build_srt, format_segments_with_timestamps
 from utils import NO_WINDOW, resource_path, sanitize_folder_name
 
@@ -426,11 +429,12 @@ class _BaseTranscribeThread(QThread):
     finished_ok = pyqtSignal(dict)
     finished_err = pyqtSignal(str)
 
-    def __init__(self, whisper, session_dir, lang):
+    def __init__(self, whisper, session_dir, lang, initial_prompt=None):
         super().__init__()
         self.whisper = whisper
         self.session_dir = session_dir
         self.lang = lang
+        self.initial_prompt = initial_prompt
         self._active_procs = []
         self._cancelled = False
 
@@ -513,6 +517,7 @@ class _BaseTranscribeThread(QThread):
                 mono, language=self.lang,
                 on_progress=lambda pct, partial: self.progress.emit(pct, partial),
                 should_cancel=lambda: self._cancelled,
+                initial_prompt=self.initial_prompt,
             )
             result["text"] = result["text"].strip()
 
@@ -549,8 +554,8 @@ class _BaseTranscribeThread(QThread):
 class ProcessThread(_BaseTranscribeThread):
     """Procesa una grabacion recien terminada."""
 
-    def __init__(self, audio, whisper, session_dir, lang):
-        super().__init__(whisper, session_dir, lang)
+    def __init__(self, audio, whisper, session_dir, lang, initial_prompt=None):
+        super().__init__(whisper, session_dir, lang, initial_prompt)
         self.audio = audio
 
     def _get_input_path(self):
@@ -564,8 +569,8 @@ class ProcessThread(_BaseTranscribeThread):
 class FileTranscribeThread(_BaseTranscribeThread):
     """Transcribe un archivo subido o arrastrado. Nunca borra el original."""
 
-    def __init__(self, whisper, file_path, session_dir, lang):
-        super().__init__(whisper, session_dir, lang)
+    def __init__(self, whisper, file_path, session_dir, lang, initial_prompt=None):
+        super().__init__(whisper, session_dir, lang, initial_prompt)
         self.file_path = file_path
 
     def _get_input_path(self):
@@ -956,6 +961,26 @@ class TranscriberApp(QMainWindow):
         text = self.model_combo.currentText()
         return None if text == config.MODEL_AUTO else text
 
+    def _current_initial_prompt(self):
+        """Texto que orienta el estilo y el vocabulario de la transcripcion."""
+        guardado = self.settings.value(config.SETTING_INITIAL_PROMPT, None, type=str)
+        return DEFAULT_INITIAL_PROMPT if guardado is None else guardado
+
+    def _edit_initial_prompt(self):
+        """Permite ajustar el texto de referencia que se le pasa al modelo."""
+        texto, ok = QInputDialog.getMultiLineText(
+            self, "Vocabulario y estilo",
+            "Whisper imita este texto: escribilo con la puntuación y los acentos que\n"
+            "querés, e incluí nombres propios, siglas o jerga que aparezcan en tus\n"
+            "audios para que no los escriba mal.\n\n"
+            "Dejalo vacío para no usar ninguno.",
+            self._current_initial_prompt(),
+        )
+        if not ok:
+            return
+        self.settings.setValue(config.SETTING_INITIAL_PROMPT, texto.strip())
+        self._set_status("Vocabulario actualizado")
+
     # ── Construccion de la interfaz ──
     def _init_ui(self):
         self.setWindowTitle(version.APP_NAME)
@@ -1294,6 +1319,10 @@ class TranscriberApp(QMainWindow):
 
         menu.addSeparator()
 
+        prompt_action = QAction("Vocabulario y estilo...", self)
+        prompt_action.triggered.connect(self._edit_initial_prompt)
+        menu.addAction(prompt_action)
+
         updates_action = QAction("Buscar actualizaciones", self)
         updates_action.triggered.connect(self.check_updates_now)
         menu.addAction(updates_action)
@@ -1594,7 +1623,7 @@ class TranscriberApp(QMainWindow):
         # El motor pudo degradar a un modelo distinto del pedido: limpiamos el
         # cache recien ahora, sabiendo cual quedo realmente en uso.
         try:
-            state.cleanup_model_cache(self.whisper.model_name)
+            state.cleanup_model_cache(model_cache_dir(self.whisper.model_name))
         except OSError as ex:
             log.warning("No se pudo limpiar el cache de modelos: %s", ex)
 
@@ -1610,7 +1639,7 @@ class TranscriberApp(QMainWindow):
 
     def _start_download_monitor(self, model_name, target_mb):
         """Sondea el tamano del directorio del modelo para mostrar la descarga."""
-        self._download_dir = paths.model_cache_dir(model_name)
+        self._download_dir = model_cache_dir(model_name)
         self._download_target_mb = max(1, target_mb)
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
@@ -1951,6 +1980,7 @@ class TranscriberApp(QMainWindow):
         thread = ProcessThread(
             self.audio, self.whisper, self._session_dir,
             LANGUAGES.get(self.lang_combo.currentText()),
+            self._current_initial_prompt(),
         )
         self._process_thread = thread
         self._wire_thread(thread, self._on_process_thread_done)
@@ -2044,6 +2074,7 @@ class TranscriberApp(QMainWindow):
         thread = FileTranscribeThread(
             self.whisper, file_path, session_dir,
             LANGUAGES.get(self.lang_combo.currentText()),
+            self._current_initial_prompt(),
         )
         self._file_thread = thread
         self._wire_thread(thread, self._on_file_thread_done)

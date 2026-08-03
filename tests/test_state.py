@@ -115,25 +115,34 @@ class ModelCacheCleanup(unittest.TestCase):
 
     def test_conserva_el_modelo_activo(self):
         activo = self._mkmodel("models--Systran--faster-whisper-small")
-        state.cleanup_model_cache("small")
+        state.cleanup_model_cache("models--Systran--faster-whisper-small")
         self.assertTrue(os.path.isdir(activo))
 
     def test_borra_otros_modelos_whisper(self):
         self._mkmodel("models--Systran--faster-whisper-small")
         viejo = self._mkmodel("models--Systran--faster-whisper-large-v3")
-        state.cleanup_model_cache("small")
+        state.cleanup_model_cache("models--Systran--faster-whisper-small")
         self.assertFalse(os.path.isdir(viejo))
 
     def test_no_toca_modelos_que_no_son_whisper(self):
         ajeno = self._mkmodel("models--sentence-transformers--all-MiniLM-L6-v2")
-        state.cleanup_model_cache("small")
+        state.cleanup_model_cache("models--Systran--faster-whisper-small")
         self.assertTrue(os.path.isdir(ajeno))
+
+    def test_conserva_un_modelo_activo_de_otra_organizacion(self):
+        # large-v3-turbo no vive bajo Systran sino bajo mobiuslabsgmbh. Cuando la
+        # ruta se armaba a mano asumiendo Systran, el nombre no coincidia y esta
+        # limpieza borraba el modelo que se acababa de descargar.
+        turbo = self._mkmodel("models--mobiuslabsgmbh--faster-whisper-large-v3-turbo")
+        self._mkmodel("models--Systran--faster-whisper-small")
+        state.cleanup_model_cache("models--mobiuslabsgmbh--faster-whisper-large-v3-turbo")
+        self.assertTrue(os.path.isdir(turbo))
 
     def test_no_toca_archivos_sueltos(self):
         suelto = os.path.join(self.models, "version.txt")
         with open(suelto, "w") as f:
             f.write("1")
-        state.cleanup_model_cache("small")
+        state.cleanup_model_cache("models--Systran--faster-whisper-small")
         self.assertTrue(os.path.isfile(suelto))
 
 

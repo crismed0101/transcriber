@@ -50,6 +50,7 @@ SETTING_TRAY_MESSAGE_SHOWN = "tray_message_shown"
 SETTING_CPU_WARNING_SHOWN = "cpu_warning_shown"
 SETTING_LAST_UPDATE_CHECK = "last_update_check"
 SETTING_SKIPPED_VERSION = "skipped_version"
+SETTING_INITIAL_PROMPT = "initial_prompt"
 
 # Cada cuanto se consulta si hay version nueva. Mas seguido molesta sin aportar:
 # los releases no salen varias veces por dia.

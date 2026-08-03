@@ -9,11 +9,17 @@ class RecommendModel(unittest.TestCase):
         self.assertEqual(hardware.recommend_model(cuda=True, vram_gb=12), "large-v3")
 
     def test_gpu_baja_de_escalon_segun_vram(self):
-        casos = [(5.0, "large-v3"), (4.0, "medium"), (3.0, "medium"),
-                 (2.5, "small"), (2.0, "small"), (1.0, "base"), (0.5, "tiny")]
+        casos = [(5.0, "large-v3"), (4.0, "large-v3-turbo"), (3.5, "large-v3-turbo"),
+                 (3.0, "medium"), (2.5, "small"), (2.0, "small"),
+                 (1.0, "base"), (0.5, "tiny")]
         for vram, esperado in casos:
             with self.subTest(vram=vram):
                 self.assertEqual(hardware.recommend_model(cuda=True, vram_gb=vram), esperado)
+
+    def test_turbo_se_prefiere_a_medium_a_igual_memoria(self):
+        # Turbo tiene el encoder de large-v3: mejor calidad que medium con VRAM parecida.
+        modelos = list(hardware.MODEL_NAMES)
+        self.assertLess(modelos.index("large-v3-turbo"), modelos.index("medium"))
 
     def test_cuda_sin_vram_medible_confia_en_la_gpu(self):
         # nvidia-smi ausente o mudo: no degradamos a ciegas.

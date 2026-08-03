@@ -35,12 +35,16 @@ _NO_GPU = GpuInfo(present=False, name="", vram_gb=0.0, driver_version="", comput
 _NEVER = float("inf")
 
 MODEL_LADDER = (
-    # nombre       min_vram_gb  min_ram_gb  size_mb
-    ("large-v3",           5.0,     _NEVER,     3000),
-    ("medium",             3.0,     _NEVER,     1500),
-    ("small",              2.0,       16.0,      480),
-    ("base",               1.0,        8.0,      145),
-    ("tiny",               0.0,        0.0,       75),
+    # nombre           min_vram_gb  min_ram_gb  size_mb
+    ("large-v3",               5.0,     _NEVER,     3000),
+    # Mismo encoder que large-v3 con 4 capas de decodificador en vez de 32: unas 6
+    # veces mas rapido y ~0.3 puntos mas de error. Entra donde large-v3 no entra, y
+    # es mejor opcion que medium a igual memoria.
+    ("large-v3-turbo",         3.5,     _NEVER,     1600),
+    ("medium",                 3.0,     _NEVER,     1500),
+    ("small",                  2.0,       16.0,      480),
+    ("base",                   1.0,        8.0,      145),
+    ("tiny",                   0.0,        0.0,       75),
 )
 
 MODEL_NAMES = tuple(m[0] for m in MODEL_LADDER)

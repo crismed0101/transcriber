@@ -183,8 +183,12 @@ def migrate_old_layout():
 
 
 # ── Limpieza del cache de modelos ──
-def cleanup_model_cache(active_model):
+def cleanup_model_cache(keep_dir_name):
     """Deja un solo modelo Whisper en el cache PROPIO de la app.
+
+    Recibe el NOMBRE DE CARPETA a conservar, no el del modelo: quien sabe en que
+    repositorio vive cada modelo es transcriber.model_cache_dir, y este modulo no
+    debe cargar faster_whisper solo para averiguarlo.
 
     Solo toca `paths.models_dir()`. Deliberadamente NO toca los caches compartidos
     de HuggingFace (~/.cache/huggingface, %LOCALAPPDATA%\\huggingface): son de todo
@@ -192,7 +196,7 @@ def cleanup_model_cache(active_model):
     que use el mismo modelo.
     """
     root = paths.models_dir()
-    keep = os.path.basename(paths.model_cache_dir(active_model))
+    keep = os.path.basename(keep_dir_name)
     try:
         entries = os.listdir(root)
     except OSError:

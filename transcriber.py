@@ -33,13 +33,35 @@ class EngineLoadError(Exception):
     """Ninguna configuracion de la escalera pudo cargarse."""
 
 
+def model_repo_id(model_name):
+    """Repositorio de HuggingFace del que sale un modelo.
+
+    No todos viven bajo la misma organizacion: los large/medium/small son de
+    Systran, pero large-v3-turbo es de mobiuslabsgmbh. Asumir una sola daba una
+    ruta de cache equivocada, y con eso la limpieza de modelos borraba el turbo
+    recien descargado.
+    """
+    try:
+        from faster_whisper.utils import _MODELS
+
+        return _MODELS.get(model_name, model_name)
+    except ImportError:
+        # Nombre de repositorio explicito, o el mismo nombre si no se puede resolver.
+        return model_name
+
+
+def model_cache_dir(model_name):
+    """Carpeta local donde queda un modelo concreto."""
+    return paths.hf_cache_dir(model_repo_id(model_name))
+
+
 def is_model_downloaded(model_name, min_bytes=50 * 1024 * 1024):
     """True si el modelo ya esta en el cache local.
 
     Heuristica por tamano: huggingface_hub deja archivos `.incomplete` mientras
     baja, asi que la sola existencia del directorio no alcanza.
     """
-    model_dir = paths.model_cache_dir(model_name)
+    model_dir = model_cache_dir(model_name)
     if not os.path.isdir(model_dir):
         return False
     total = 0
@@ -57,6 +79,77 @@ def is_model_downloaded(model_name, min_bytes=50 * 1024 * 1024):
     except OSError:
         pass
     return False
+
+
+# ── Opciones de decodificacion ──
+#
+# Solo se declara lo que se aparta del valor por defecto de faster-whisper. Lo que
+# no aparece aca se deja como viene, y eso es deliberado: los defaults son el
+# mecanismo con el que Whisper detecta y corta sus propios bucles de repeticion.
+#
+#   compression_ratio_threshold (2.4)  si el texto sale sospechosamente repetitivo,
+#                                      lo da por fallido y reintenta con otra
+#                                      temperatura.
+#   prompt_reset_on_temperature (0.5)  al reintentar descarta el contexto que llevo
+#                                      al bucle. Solo funciona con
+#                                      condition_on_previous_text=True.
+#   temperature (escalera 0.0 a 1.0)   los reintentos progresivos.
+#   condition_on_previous_text (True)  da contexto entre ventanas: puntuacion y
+#                                      nombres propios consistentes.
+#
+# NO usar repetition_penalty ni no_repeat_ngram_size para frenar los bucles: no
+# distinguen una repeticion patologica de una legitima, y en habla natural las
+# repeticiones son normales. Prohibirlas obliga al modelo a escribir algo distinto
+# de lo que se dijo, que es exactamente lo contrario de transcribir.
+DECODE_OPTIONS = dict(
+    # Mas exploracion que el default (5 y 1): mejor calidad a cambio de tiempo.
+    beam_size=10,
+    patience=2.0,
+    # Habilita hallucination_silence_threshold, que sin esto no hace nada.
+    word_timestamps=True,
+    # Descarta texto inventado en silencios de mas de 2 s.
+    hallucination_silence_threshold=2.0,
+)
+
+# ── Deteccion de voz (VAD Silero) ──
+#
+# Recorta los silencios antes de transcribir. Hay que tener cuidado: es la unica
+# parte del proceso que puede DESCARTAR audio antes de que el modelo lo vea.
+VAD_OPTIONS = dict(
+    # Mas sensible que el default (0.5) para no perder voz baja o lejana.
+    threshold=0.35,
+    # min_speech_duration_ms se deja en 0 (el default) A PROPOSITO: cualquier valor
+    # mayor descarta por completo los fragmentos mas cortos, y en español "si",
+    # "no", "y" o "ya" duran menos de un cuarto de segundo.
+    min_speech_duration_ms=0,
+    # Entre el default (2000) y un valor agresivo: fragmentos naturales sin retrasar
+    # de mas la aparicion del texto en pantalla.
+    min_silence_duration_ms=800,
+    speech_pad_ms=400,
+)
+
+# Texto que orienta el estilo de salida. Whisper imita lo que ve aca, asi que un
+# ejemplo con acentos y puntuacion correctos mejora ambas cosas de forma notable.
+DEFAULT_INITIAL_PROMPT = (
+    "Transcripción en español, con puntuación, acentos y mayúsculas correctas."
+)
+
+
+def build_transcribe_options(language=None, initial_prompt=None):
+    """Arma las opciones para WhisperModel.transcribe().
+
+    Separado de la llamada para poder verificarlo sin cargar un modelo.
+    """
+    options = dict(DECODE_OPTIONS)
+    options["language"] = language
+    options["initial_prompt"] = (
+        initial_prompt if initial_prompt is not None else DEFAULT_INITIAL_PROMPT
+    ) or None
+    # El VAD requiere onnxruntime, que faster_whisper importa de forma perezosa:
+    # por eso el empaquetado lo incluye de forma explicita (ver Transcriber.spec).
+    options["vad_filter"] = True
+    options["vad_parameters"] = dict(VAD_OPTIONS)
+    return options
 
 
 def _audio_duration(path):
@@ -191,7 +284,8 @@ class Transcriber:
             self._load_lock.release()
 
     # ── Transcripcion ──
-    def transcribe(self, audio_path, language="es", on_progress=None, should_cancel=None):
+    def transcribe(self, audio_path, language="es", on_progress=None,
+                   should_cancel=None, initial_prompt=None):
         """Transcribe un WAV mono de 16 kHz.
 
         Args:
@@ -199,6 +293,8 @@ class Transcriber:
             language: codigo ISO, o None para auto-detectar.
             on_progress: callback(pct, texto_parcial) por segmento.
             should_cancel: callable que devuelve True para abortar.
+            initial_prompt: texto que orienta el estilo y el vocabulario. None usa
+                el de por defecto; cadena vacia lo desactiva.
 
         Returns:
             dict con text, segments, language, language_probability, cancelled.
@@ -209,24 +305,7 @@ class Transcriber:
 
         segments_iter, info = self._model.transcribe(
             audio_path,
-            language=language,
-            beam_size=10,
-            best_of=5,
-            patience=2.0,
-            repetition_penalty=1.1,
-            no_repeat_ngram_size=3,
-            condition_on_previous_text=False,
-            hallucination_silence_threshold=2.0,
-            # El VAD Silero se aplica siempre. Requiere onnxruntime, que
-            # faster_whisper importa de forma perezosa: por eso el empaquetado lo
-            # incluye de forma explicita (ver Transcriber.spec).
-            vad_filter=True,
-            vad_parameters=dict(
-                threshold=0.35,
-                min_silence_duration_ms=300,
-                speech_pad_ms=400,
-                min_speech_duration_ms=250,
-            ),
+            **build_transcribe_options(language, initial_prompt),
         )
 
         text_parts = []

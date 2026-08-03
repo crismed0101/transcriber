@@ -125,13 +125,14 @@ def models_dir():
     return d
 
 
-def model_cache_dir(model_name):
-    """Carpeta donde huggingface_hub deja un modelo Whisper concreto.
+def hf_cache_dir(repo_id):
+    """Carpeta donde huggingface_hub deja un repositorio concreto.
 
-    Unica definicion del layout del cache HF: la usan el monitor de descarga, la
-    limpieza de modelos viejos y el chequeo de "ya esta bajado".
+    huggingface_hub convierte 'org/nombre' en 'models--org--nombre'. Quien resuelve
+    que repositorio corresponde a cada modelo es transcriber.model_cache_dir: no
+    todos los modelos Whisper viven bajo la misma organizacion.
     """
-    return os.path.join(models_dir(), f"models--Systran--faster-whisper-{model_name}")
+    return os.path.join(models_dir(), "models--" + repo_id.replace("/", "--"))
 
 
 def bin_dir():
