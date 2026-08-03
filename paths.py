@@ -1,21 +1,32 @@
-"""Manejo de paths: SIEMPRE modo estandar Windows, en cualquier PC.
+"""Rutas de la app, resueltas contra las Known Folders reales de Windows.
 
-La app sigue las Known Folders de Microsoft, sin importar desde donde se ejecute
-(C:\\DevMed, USB, etc.). Es lo que el usuario espera: lo que el genera va a
-Documents, los datos internos de la app van al cache local del sistema.
-    data_dir   = ~/Documents/Transcriber/      (transcripciones + audios del usuario)
-    system_dir = %LOCALAPPDATA%/Transcriber/   (modelos, logs, settings)
+Layout, en cualquier PC y sin importar desde donde se ejecute el .exe:
+    data_dir   = <Documentos>/Transcriber/      transcripciones + audios del usuario
+    system_dir = %LOCALAPPDATA%/Transcriber/    modelos, logs, settings
 
-El antiguo modo portable (marker portable.txt junto al .exe) quedo DESACTIVADO;
-ver is_portable(). Si aparece un portable.txt de un build viejo, se ignora.
+Por que Known Folders y no "%USERPROFILE%\\Documents":
+    Con OneDrive Backup activado (el default en Windows 11 con cuenta Microsoft),
+    la carpeta Documentos se redirige a %USERPROFILE%\\OneDrive\\Documents. Armar la
+    ruta a mano deja los archivos en la carpeta huerfana: la app los encuentra
+    porque usa rutas absolutas, pero el usuario abre Documentos en el Explorador y
+    no ve nada. SHGetKnownFolderPath devuelve la ruta que el shell resuelve de
+    verdad, redirigida o no.
 
-Importar este modulo SETEA HF_HOME / HUGGINGFACE_HUB_CACHE para que faster_whisper
-descargue los modelos al directorio correcto. Debe importarse ANTES que faster_whisper.
+IMPORTANTE: importar este modulo SETEA HF_HOME / HUGGINGFACE_HUB_CACHE para que
+faster_whisper descargue los modelos al directorio correcto. Debe importarse ANTES
+que faster_whisper.
 """
 import os
 import sys
+import ctypes
+import logging
 
-PORTABLE_MARKER = "portable.txt"
+log = logging.getLogger(__name__)
+
+APP_DIRNAME = "Transcriber"
+
+# FOLDERID_Documents — https://learn.microsoft.com/windows/win32/shell/knownfolderid
+_FOLDERID_DOCUMENTS = "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}"
 
 
 def is_frozen():
@@ -29,39 +40,80 @@ def app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
-def is_portable():
-    """Modo portable DESACTIVADO por decision de producto.
+class _GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", ctypes.c_uint32),
+        ("Data2", ctypes.c_uint16),
+        ("Data3", ctypes.c_uint16),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
 
-    Antes se activaba si existia <app>/portable.txt junto al .exe, lo que hacia
-    que la app guardara todo junto al ejecutable. Eso confundia al usuario porque
-    cada copia (C:\\DevMed, USB, etc.) escribia en su propia carpeta en vez de en
-    Documents. Ahora la app SIEMPRE usa rutas estandar Windows en cualquier PC:
-        transcripciones/audios -> ~/Documents/Transcriber/
-        modelos/logs/settings  -> %LOCALAPPDATA%/Transcriber/
-    El archivo portable.txt, si existe, se ignora.
+
+def _known_folder(folder_guid):
+    """Resuelve una Known Folder de Windows. None si no se puede.
+
+    Usa SHGetKnownFolderPath, que respeta las redirecciones de carpeta (OneDrive,
+    politicas de dominio, perfiles moviles).
     """
-    return False
+    if sys.platform != "win32":
+        return None
+    try:
+        guid = _GUID()
+        # CLSIDFromString parsea el formato "{...}" y llena la estructura GUID.
+        if ctypes.windll.ole32.CLSIDFromString(folder_guid, ctypes.byref(guid)) != 0:
+            return None
+        out = ctypes.c_wchar_p()
+        # dwFlags=0, hToken=NULL (usuario actual)
+        hr = ctypes.windll.shell32.SHGetKnownFolderPath(
+            ctypes.byref(guid), 0, None, ctypes.byref(out)
+        )
+        if hr != 0 or not out.value:
+            return None
+        try:
+            return out.value
+        finally:
+            # El caller es dueno del buffer y debe liberarlo con CoTaskMemFree.
+            ctypes.windll.ole32.CoTaskMemFree(out)
+    except Exception:
+        log.warning("SHGetKnownFolderPath fallo para %s", folder_guid, exc_info=True)
+        return None
+
+
+def documents_dir():
+    """Carpeta Documentos del usuario, redirigida o no."""
+    return _known_folder(_FOLDERID_DOCUMENTS) or os.path.join(
+        os.path.expanduser("~"), "Documents"
+    )
+
+
+def legacy_documents_dir():
+    """La ruta que la app usaba antes: '~/Documents' armada a mano.
+
+    Solo sirve para migrar datos de instalaciones previas (ver state.migrate).
+    Devuelve None si coincide con la ruta actual, o sea si no hay nada que migrar.
+    """
+    legacy = os.path.join(os.path.expanduser("~"), "Documents")
+    current = documents_dir()
+    if os.path.normcase(os.path.normpath(legacy)) == os.path.normcase(
+        os.path.normpath(current)
+    ):
+        return None
+    return legacy
 
 
 def data_dir():
     """Donde van las transcripciones del usuario."""
-    if is_portable():
-        d = os.path.join(app_dir(), "transcripciones")
-    else:
-        d = os.path.join(os.path.expanduser("~"), "Documents", "Transcriber")
+    d = os.path.join(documents_dir(), APP_DIRNAME)
     os.makedirs(d, exist_ok=True)
     return d
 
 
 def system_dir():
     """Donde van log, settings y modelos."""
-    if is_portable():
-        d = os.path.join(app_dir(), "_sistema")
-    else:
-        appdata = os.environ.get("LOCALAPPDATA") or os.path.join(
-            os.path.expanduser("~"), "AppData", "Local"
-        )
-        d = os.path.join(appdata, "Transcriber")
+    appdata = os.environ.get("LOCALAPPDATA") or os.path.join(
+        os.path.expanduser("~"), "AppData", "Local"
+    )
+    d = os.path.join(appdata, APP_DIRNAME)
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -71,6 +123,15 @@ def models_dir():
     d = os.path.join(system_dir(), "models")
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def model_cache_dir(model_name):
+    """Carpeta donde huggingface_hub deja un modelo Whisper concreto.
+
+    Unica definicion del layout del cache HF: la usan el monitor de descarga, la
+    limpieza de modelos viejos y el chequeo de "ya esta bajado".
+    """
+    return os.path.join(models_dir(), f"models--Systran--faster-whisper-{model_name}")
 
 
 def bin_dir():
@@ -93,8 +154,8 @@ def log_path():
     return os.path.join(system_dir(), "transcriber.log")
 
 
-# ── Side effect: setear cache HF antes que faster_whisper se importe ──
-# (TRANSFORMERS_CACHE quedo deprecado en huggingface_hub; HF_HOME ya cubre todo.)
+# ── Side effect: fijar el cache de HuggingFace antes de que se importe faster_whisper ──
+# Sin esto los modelos caerian en ~/.cache/huggingface, fuera del control de la app.
 _models = models_dir()
 os.environ.setdefault("HF_HOME", _models)
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", _models)

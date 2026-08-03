@@ -1,69 +1,121 @@
 ============================================================
- TRANSCRIBER - Transcribir audio a texto (offline) con Whisper
+ TRANSCRIBER - Transcribir audio a texto, sin internet
 ============================================================
+
+Transcribe con Whisper en tu propia PC. El audio nunca sale
+de tu equipo.
+
 
 USO RAPIDO
 ----------
-1. Doble click en Transcriber.exe.
-2. La primera vez la app baja el modelo Whisper (entre 75 MB
-   y 3 GB segun el modelo elegido). Tene paciencia.
-3. Para grabar el audio del sistema (lo que estas escuchando):
+1. Abri Transcriber.
+2. La primera vez se descarga el modelo (entre 75 MB y 3 GB
+   segun tu equipo). Es una sola vez; despues funciona sin
+   internet.
+3. Para grabar lo que estas escuchando:
    - Click en GRABAR.
-   - Cuando termines, click en DETENER.
-   - Esperar la transcripcion. Click en Guardar para .txt.
-4. Para transcribir un archivo de audio existente:
-   - Click en SUBIR ARCHIVO, o
-   - Arrastra el archivo sobre la ventana.
+   - Al terminar, click en DETENER.
+   - Podes ponerle un nombre a la grabacion (opcional).
+4. Para transcribir archivos que ya tenes:
+   - Click en SUBIR ARCHIVO (podes elegir varios a la vez), o
+   - Arrastralos sobre la ventana.
 
-MODELO WHISPER
---------------
-La app detecta tu hardware y elige un modelo automaticamente
-en modo "Auto". Si querer mas precision o mas velocidad,
-elegi manualmente:
-   tiny       - ~75 MB,  el mas rapido, calidad basica
-   base       - ~140 MB, rapido, calidad ok
-   small      - ~480 MB, balance
-   medium     - ~1.5 GB, mejor calidad, requiere GPU 3GB+
-   large-v3   - ~3 GB,   maxima calidad, GPU 5GB+ recomendado
+El texto aparece en pantalla mientras se transcribe. Se
+guarda solo, y podes editarlo y volver a guardar.
 
-Cambiar de modelo recarga el motor (~5-15s).
+
+DONDE QUEDAN TUS ARCHIVOS
+-------------------------
+Transcripciones y audios:
+   Documentos\Transcriber\<fecha>\transcripcion-N\
+       audio.mp3            copia del audio
+       transcripcion.txt    el texto, con marcas de tiempo
+       transcripcion.srt    subtitulos (si los exportas)
+
+El boton "Abrir" te lleva directo a la carpeta de la
+transcripcion que estas viendo, y "Historial" lista todas.
+
+Modelos, ajustes y registro de errores:
+   %LOCALAPPDATA%\Transcriber\
+
+Desinstalar la app NO borra nada de esto.
+
+
+ELEGIR EL MODELO
+----------------
+El desplegable "Modelo" define la calidad:
+
+   Automatico  elige el mejor que tu equipo aguanta (recomendado)
+   tiny        ~75 MB    el mas rapido, calidad basica
+   base        ~145 MB   rapido, calidad aceptable
+   small       ~480 MB   equilibrado
+   medium      ~1.5 GB   mejor calidad, necesita placa NVIDIA
+   large-v3    ~3 GB     la mejor calidad, necesita placa NVIDIA
+
+Si elegis uno que no entra en la memoria de tu equipo, la app
+baja sola al siguiente que si entra: no se rompe ni se cuelga.
+Cambiar de modelo recarga el motor y puede descargar archivos
+nuevos la primera vez.
+
+
+VELOCIDAD
+---------
+Con una placa NVIDIA la transcripcion es varias veces mas
+rapida. Sin ella funciona igual, pero mas lento, y la app
+elige un modelo mas liviano para compensar.
+
+El recuadro de arriba a la izquierda te dice que esta usando:
+"GPU: ..." o "CPU (lento)".
+
 
 ATAJOS
 ------
-- Ctrl+Shift+R: Iniciar/detener grabacion (funciona aunque
-  la ventana este minimizada en la bandeja).
-- Cerrar (X): minimiza a la bandeja del sistema. Click derecho
-  en el icono > Salir para cerrar la app.
+Ctrl+Shift+R    Iniciar o detener la grabacion. Funciona
+                aunque la app este minimizada en la bandeja.
+                Si otro programa ya usa esa combinacion, el
+                atajo responde solo con la ventana enfocada.
 
-PORTABLE
---------
-La carpeta es portable: copiala a un USB o a otra PC y funciona.
-Todo (modelos descargados, transcripciones, settings) se guarda
-en subcarpetas:
-   data/    - tus transcripciones (.wav, .mp3, .txt) y log
-   models/  - modelos Whisper bajados
-   bin/     - ffmpeg incluido
+Click derecho sobre el texto: exportar subtitulos (.srt).
 
-REQUISITOS
-----------
-- Windows 10 / 11 (x64).
-- 4 GB de RAM minimo (8 GB+ recomendado).
-- GPU NVIDIA con CUDA es OPCIONAL pero hace la transcripcion
-  10-20x mas rapida.
+Cerrar con la X manda la app a la bandeja del sistema (al
+lado del reloj). Para cerrarla de verdad: click derecho en el
+icono de la bandeja > Salir.
 
-TROUBLESHOOTING
----------------
-- "FFmpeg no encontrado": la carpeta bin/ debe estar al lado
-  del .exe. Si la perdiste, descargala de gyan.dev/ffmpeg.
-- App se cierra al transcribir: tu hardware no alcanza para el
-  modelo elegido. Bajalo a 'small' o 'base' en el desplegable.
-- Sin audio: para grabar lo que escuchas, Windows necesita un
-  dispositivo de salida activo (parlantes/auriculares).
-- Logs detallados en data/transcriber.log
+
+PROBLEMAS FRECUENTES
+--------------------
+"Windows protegio su PC" al instalar
+   La app no esta firmada digitalmente. Click en "Mas
+   informacion" y despues en "Ejecutar de todas formas".
+
+"FFmpeg no encontrado"
+   Falta la carpeta bin\ junto al ejecutable. Reinstala.
+
+Va muy lento
+   Estas en CPU. Elegi un modelo mas chico (small o base), o
+   usa una PC con placa NVIDIA.
+
+"GPU NVIDIA detectada, pero sin CUDA"
+   Actualiza los drivers desde nvidia.com/drivers y volve a
+   abrir la app.
+
+No graba nada / "Sin audio detectado"
+   Para grabar lo que escuchas, Windows necesita un
+   dispositivo de salida activo (parlantes o auriculares).
+   Para dictar tu voz, cambia "Fuente" a Microfono.
+
+Algo falla y no se por que
+   El detalle queda en:
+   %LOCALAPPDATA%\Transcriber\transcriber.log
+
+   Y para un diagnostico completo, desde una consola:
+   Transcriber.exe --selftest
+
 
 LICENCIAS
 ---------
-- Codigo de la app: tu licencia preferida.
-- FFmpeg: LGPL (ver bin/FFMPEG-LICENSE.txt).
-- Modelo Whisper: MIT (OpenAI).
-- PyQt6: GPLv3 / Riverbank Commercial.
+Transcriber se distribuye bajo GPL-3.0 (ver LICENSE).
+   - FFmpeg: LGPL (ver bin\FFMPEG-LICENSE.txt)
+   - Modelo Whisper: MIT (OpenAI)
+   - PyQt6: GPL-3.0 o licencia comercial de Riverbank
+   - faster-whisper y CTranslate2: MIT

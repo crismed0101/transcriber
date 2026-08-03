@@ -1,3 +1,4 @@
+"""Transcriber — app de escritorio para transcribir audio a texto con Whisper."""
 import os
 import re
 import sys
@@ -12,114 +13,150 @@ import datetime
 import traceback
 import ctypes
 
+if sys.platform == "win32":
+    # `import ctypes` no arrastra wintypes; hace falta para leer el MSG del
+    # filtro de eventos nativo que atiende el hotkey global.
+    import ctypes.wintypes
+
+# paths.py se importa antes que faster_whisper para fijar HF_HOME al directorio
+# de modelos de la app.
+import paths
+import state
+import version
+
+# El autodiagnostico corre sin interfaz: se atiende antes de construir nada de Qt.
+if "--selftest" in sys.argv:
+    import selftest
+
+    sys.exit(selftest.run())
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QComboBox, QLabel, QProgressBar, QFileDialog,
     QSystemTrayIcon, QMenu, QSplashScreen, QMessageBox,
     QDialog, QListWidget, QListWidgetItem, QInputDialog,
 )
-from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QSettings
+from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QSettings, QAbstractNativeEventFilter
 from PyQt6.QtGui import (
     QShortcut, QKeySequence, QPixmap, QPainter, QColor, QFont, QIcon, QAction,
 )
 from PyQt6.QtNetwork import QLocalSocket, QLocalServer
 
-# paths.py se importa antes que faster_whisper para fijar HF_HOME al directorio portable
-import paths
-import state
-
-# Pre-migrar log/settings ANTES de abrir el FileHandler (file lock issue en Windows)
+# Pre-migrar log/settings ANTES de abrir el FileHandler: Windows no deja mover
+# archivos en uso.
 state.pre_migrate_log_settings()
 
 
 # ── Constantes ──
-APP_ORG = "CrisMed"
-APP_NAME = "Transcriber"
-APP_USER_MODEL_ID = "CrisMed.Transcriber.1"
-# Per-user para evitar colisiones en sesiones de Remote Desktop / multi-usuario
+# Clave per-user para que dos sesiones de Escritorio Remoto no colisionen.
 try:
     _USER_TAG = getpass.getuser() or "default"
 except Exception:
     _USER_TAG = "default"
-SINGLE_INSTANCE_KEY = f"CrisMed.Transcriber.SingleInstance.v1.{_USER_TAG}"
+SINGLE_INSTANCE_KEY = f"{version.APP_USER_MODEL_ID}.SingleInstance.v1.{_USER_TAG}"
 
-AUDIO_EXTS = (".mp3", ".wav", ".m4a", ".ogg", ".flac", ".wma", ".aac", ".opus", ".webm")
-
-LOG_MAX_BYTES = 2 * 1024 * 1024  # 2 MB
+LOG_MAX_BYTES = 2 * 1024 * 1024
 LOG_BACKUP_COUNT = 3
 SOCKET_TIMEOUT_MS = 800
+QUEUE_GAP_MS = 150          # respiro de UI entre archivos de una cola
+THREAD_STOP_TIMEOUT_MS = 5000
 
-# Limites de Windows MAX_PATH para audio.mp3 / transcripcion.txt
-MAX_SESSION_DIR_LEN = 240
+# Hotkey global (Win32). Con hwnd=NULL el hotkey queda asociado al hilo y el
+# WM_HOTKEY llega al filtro de eventos nativo de la aplicacion.
+HOTKEY_ID = 1
+_MOD_SHIFT = 0x0004
+_MOD_CONTROL = 0x0002
+_MOD_NOREPEAT = 0x4000
+_VK_R = 0x52
+_WM_HOTKEY = 0x0312
+HOTKEY_TEXT = "Ctrl+Shift+R"
 
 
 def _build_log_handlers():
-    """File handler con rotacion + StreamHandler si hay consola.
+    """Handler de archivo con rotacion, mas consola si la hay.
 
-    Si la ubicacion preferida es read-only, fallback a %TEMP%.
+    Si la ubicacion preferida es de solo lectura, cae a %TEMP%.
     """
     handlers = []
-    candidates = [paths.log_path(), os.path.join(tempfile.gettempdir(), "Transcriber", "transcriber.log")]
+    candidates = [
+        paths.log_path(),
+        os.path.join(tempfile.gettempdir(), "Transcriber", "transcriber.log"),
+    ]
     for path in candidates:
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            h = logging.handlers.RotatingFileHandler(
-                path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8",
-            )
-            handlers.append(h)
+            handlers.append(logging.handlers.RotatingFileHandler(
+                path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT,
+                encoding="utf-8",
+            ))
             break
-        except Exception:
+        except OSError:
             continue
     if sys.stderr is not None:
         handlers.append(logging.StreamHandler())
     return handlers
 
 
-_handlers = _build_log_handlers()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=_handlers,
+    handlers=_build_log_handlers(),
 )
 log = logging.getLogger(__name__)
 
 
 def _excepthook(exc_type, exc_value, exc_tb):
-    log.critical("Excepcion no capturada:\n%s", "".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
+    """Registra la excepcion y, si hay interfaz, la muestra.
+
+    Con console=False una excepcion sin capturar mataba el proceso en silencio: el
+    usuario veia la app "no abrir" y no habia forma de que reportara nada util.
+    """
+    detail = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    log.critical("Excepcion no capturada:\n%s", detail)
+    if QApplication.instance() is not None:
+        try:
+            QMessageBox.critical(
+                None, f"{version.APP_NAME} — error inesperado",
+                f"Ocurrio un error inesperado:\n\n{exc_value}\n\n"
+                f"El detalle quedo en:\n{paths.log_path()}",
+            )
+        except Exception:
+            pass
 
 
 sys.excepthook = _excepthook
 
-# Identidad para la barra de tareas (Windows): que NO use el icono de Python
+# Identidad en la barra de tareas: sin esto Windows agrupa la ventana bajo Python.
 if sys.platform == "win32":
     try:
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            version.APP_USER_MODEL_ID
+        )
     except Exception as ex:
-        log.warning("No se pudo setear AppUserModelID: %s", ex)
+        log.warning("No se pudo fijar el AppUserModelID: %s", ex)
 
-# Agregar DLLs de NVIDIA al PATH (para CUDA en dev mode)
-for _base in [os.path.dirname(sys.executable), os.path.join(os.path.dirname(__file__), "venv", "Scripts")]:
-    _sp = os.path.join(_base, "..", "Lib", "site-packages")
-    for _d in glob.glob(os.path.join(_sp, "nvidia", "*", "bin")):
-        os.add_dll_directory(os.path.abspath(_d))
-        os.environ["PATH"] = os.path.abspath(_d) + os.pathsep + os.environ.get("PATH", "")
+# En modo desarrollo las DLL de CUDA viven dentro del venv y hay que sumarlas al
+# search path. En el .exe empaquetado ya quedan junto a ctranslate2 (ver el .spec).
+if sys.platform == "win32" and not paths.is_frozen():
+    for _base in (os.path.dirname(sys.executable),
+                  os.path.join(os.path.dirname(os.path.abspath(__file__)), "venv", "Scripts")):
+        for _dll_dir in glob.glob(os.path.join(_base, "..", "Lib", "site-packages",
+                                               "nvidia", "*", "bin")):
+            _dll_dir = os.path.abspath(_dll_dir)
+            try:
+                os.add_dll_directory(_dll_dir)
+            except OSError:
+                continue
+            os.environ["PATH"] = _dll_dir + os.pathsep + os.environ.get("PATH", "")
 
-from config import OUTPUT_DIR, LANGUAGES, FFMPEG_BIN, WHISPER_DEVICE, AUDIO_FORMATS, WHISPER_MODEL
-from audio_capture import AudioCapture
-from transcriber import Transcriber, build_srt, format_segments_with_timestamps
-from utils import NO_WINDOW, resource_path
-from audio_capture import SOURCE_LOOPBACK, SOURCE_MIC
+import config
 import hardware
-
-# Tamanos aproximados (MB) de cada modelo Whisper, para mostrar progreso de descarga.
-MODEL_SIZES_MB = {
-    "tiny": 75,
-    "base": 145,
-    "small": 480,
-    "medium": 1500,
-    "large-v3": 3000,
-}
+from config import OUTPUT_DIR, LANGUAGES, FFMPEG_BIN, AUDIO_FORMATS, AUDIO_EXTS
+from audio_capture import AudioCapture, SOURCE_LOOPBACK, SOURCE_MIC
+from transcriber import Transcriber, EngineCancelled, is_model_downloaded
+from subtitles import build_srt, format_segments_with_timestamps
+from utils import NO_WINDOW, resource_path, sanitize_folder_name
 
 AUDIO_SOURCES = {
     "Audio del sistema": SOURCE_LOOPBACK,
@@ -127,7 +164,7 @@ AUDIO_SOURCES = {
 }
 
 
-# ── Paleta (GitHub Dark inspired) ──
+# ── Paleta (inspirada en GitHub Dark) ──
 C_BG = "#0d1117"
 C_SURFACE = "#161b22"
 C_BORDER = "#21262d"
@@ -147,7 +184,6 @@ C_BLUE_HI = "#388bfd"
 C_GRAY = "#484f58"
 C_GRAY_HI = "#6e7681"
 
-# ── Estilos globales (hovers, focus, menus, scrollbars) ──
 STYLE = f"""
 QMainWindow {{ background-color: {C_BG}; }}
 QWidget {{ background-color: transparent; }}
@@ -163,9 +199,10 @@ QTextEdit[droptarget="true"] {{ border: 2px dashed {C_BLUE}; background-color: #
 
 QComboBox {{
     background-color: {C_BORDER}; color: {C_TEXT}; border: 1px solid {C_BORDER_HI};
-    border-radius: 8px; padding: 6px 12px; font-size: 12px; min-width: 130px;
+    border-radius: 8px; padding: 6px 12px; font-size: 12px; min-width: 120px;
 }}
 QComboBox:hover {{ border-color: {C_ACCENT}; }}
+QComboBox:disabled {{ color: {C_TEXT_MUTED}; border-color: {C_BORDER}; }}
 QComboBox::drop-down {{ border: none; padding-right: 10px; }}
 QComboBox QAbstractItemView {{
     background-color: {C_SURFACE}; color: {C_TEXT}; border: 1px solid {C_BORDER_HI};
@@ -196,7 +233,6 @@ QToolTip {{
 
 
 def _btn_style(bg, hover_bg, height=34, radius=18, font_size=12, color="white"):
-    """Genera QSS para un boton con hover."""
     return (
         f"QPushButton {{ background-color: {bg}; color: {color}; border: none; "
         f"border-radius: {radius}px; padding: 0 18px; font-weight: bold; font-size: {font_size}px; "
@@ -223,7 +259,6 @@ def _btn_outline(border, hover_border, color, height=32, radius=10, font_size=12
     )
 
 
-# Estilos por boton (height + colores). Hover incluido.
 S_REC = _btn_style(C_RED, C_RED_HI, height=44, radius=22, font_size=13)
 S_REC_OFF = _btn_style(C_GRAY, C_GRAY_HI, height=44, radius=22, font_size=13)
 S_REC_DISABLED = _btn_disabled(height=44, radius=22, font_size=13)
@@ -233,14 +268,12 @@ S_STOP = _btn_style(C_RED, C_RED_HI)
 S_UPLOAD = _btn_style(C_BLUE, C_BLUE_HI)
 S_BTN_DISABLED = _btn_disabled()
 
-# Pequenos (footer)
 S_OPEN = _btn_style(C_GREEN, C_GREEN_HI, height=30, radius=10, font_size=11)
 S_COPY = _btn_outline(C_BORDER, C_BORDER_HI, C_TEXT_DIM, height=30, radius=10, font_size=11)
 S_FOLDER = _btn_outline(C_BORDER, C_BORDER_HI, C_TEXT_MUTED, height=30, radius=10, font_size=11)
 S_OPEN_DISABLED = _btn_disabled(height=30, radius=10, font_size=11)
 S_COPY_DISABLED = _btn_disabled(height=30, radius=10, font_size=11)
 
-# Chips (status, hardware)
 S_CHIP = (f"background-color: {C_SURFACE}; border: 1px solid {C_BORDER}; "
           f"border-radius: 12px; padding: 4px 12px; font-size: 11px; color: {C_TEXT_DIM};")
 S_CHIP_OK = (f"background-color: rgba(35,134,54,0.15); border: 1px solid {C_GREEN}; "
@@ -252,28 +285,27 @@ S_CHIP_ERR = (f"background-color: {C_RED}; border: none; border-radius: 12px; "
 S_CHIP_HW = (f"background-color: transparent; border: 1px solid {C_BORDER_HI}; "
              f"border-radius: 10px; padding: 3px 10px; font-size: 10px; color: {C_TEXT_DIM};")
 S_CHIP_HW_GPU = (f"background-color: rgba(56,139,253,0.10); border: 1px solid {C_BLUE_HI}; "
-                 f"border-radius: 10px; padding: 3px 10px; font-size: 10px; color: {C_BLUE_HI}; font-weight: 600;")
+                 f"border-radius: 10px; padding: 3px 10px; font-size: 10px; "
+                 f"color: {C_BLUE_HI}; font-weight: 600;")
 
 
 def make_app_icon():
-    """Carga icon.ico si existe; si no, genera uno en runtime."""
+    """Carga icon.ico si existe; si no, dibuja uno en runtime."""
     ico_path = resource_path("icon.ico")
     if os.path.exists(ico_path):
         return QIcon(ico_path)
 
-    sizes = [16, 32, 48, 64, 128, 256]
     icon = QIcon()
-    for s in sizes:
+    for s in (16, 32, 48, 64, 128, 256):
         pm = QPixmap(s, s)
         pm.fill(QColor(0, 0, 0, 0))
         p = QPainter(pm)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setBrush(QColor("#da3633"))
+        p.setBrush(QColor(C_RED))
         p.setPen(Qt.PenStyle.NoPen)
         p.drawEllipse(1, 1, s - 2, s - 2)
         p.setPen(QColor("white"))
-        f = QFont("Arial", int(s * 0.45), QFont.Weight.Bold)
-        p.setFont(f)
+        p.setFont(QFont("Arial", int(s * 0.45), QFont.Weight.Bold))
         p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "T")
         p.end()
         icon.addPixmap(pm)
@@ -281,17 +313,17 @@ def make_app_icon():
 
 
 def make_splash_pixmap():
-    """Pixmap del splash screen (380x220, dark themed)."""
+    """Pixmap del splash (380x220, tema oscuro)."""
     pm = QPixmap(380, 220)
-    pm.fill(QColor("#0d1117"))
+    pm.fill(QColor(C_BG))
     p = QPainter(pm)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-    p.setPen(QColor("#21262d"))
+    p.setPen(QColor(C_BORDER))
     p.drawRoundedRect(0, 0, 379, 219, 12, 12)
 
     cx, cy, r = 190, 80, 32
-    p.setBrush(QColor("#da3633"))
+    p.setBrush(QColor(C_RED))
     p.setPen(Qt.PenStyle.NoPen)
     p.drawEllipse(cx - r, cy - r, r * 2, r * 2)
     p.setPen(QColor("white"))
@@ -300,60 +332,115 @@ def make_splash_pixmap():
 
     p.setPen(QColor("#ff6b6b"))
     p.setFont(QFont("Arial", 16, QFont.Weight.Bold))
-    p.drawText(pm.rect().adjusted(0, 130, 0, 0), Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, "TRANSCRIBER")
+    p.drawText(pm.rect().adjusted(0, 130, 0, 0),
+               Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+               version.APP_NAME.upper())
 
+    p.setPen(QColor(C_TEXT_MUTED))
+    p.setFont(QFont("Arial", 9))
+    p.drawText(pm.rect().adjusted(0, 158, 0, 0),
+               Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+               f"v{version.__version__}")
     p.end()
     return pm
 
 
-# ── Threads de procesamiento ──
-class _BaseTranscribeThread(QThread):
-    """Base compartida para grabacion y subida de archivo.
+# ── Hilos de trabajo ──
+class ModelLoadThread(QThread):
+    """Carga el motor Whisper sin bloquear la interfaz.
 
-    Subclases implementan `_get_input_path()` para producir el audio a procesar.
+    Es una subclase de verdad, no un QThread con `run` reasignado: asi la
+    cancelacion y las senales quedan en el mismo objeto y no hay que adivinar a
+    quien pertenece el estado.
+    """
+    attempt = pyqtSignal(str, str)   # (modelo, device) antes de cada intento
+    done = pyqtSignal(str)           # "" = ok | "cancelado" | mensaje de error
+
+    def __init__(self, whisper):
+        super().__init__()
+        self.whisper = whisper
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            self.whisper.load_model(
+                should_cancel=lambda: self._cancelled,
+                on_attempt=lambda name, device: self.attempt.emit(name, device),
+            )
+            self.done.emit("")
+        except EngineCancelled:
+            self.done.emit("cancelado")
+        except Exception as ex:
+            log.error("Error cargando el motor Whisper", exc_info=True)
+            self.done.emit(str(ex))
+
+
+class _BaseTranscribeThread(QThread):
+    """Base compartida entre grabacion y archivo subido.
+
+    Las subclases implementan `_get_input_path()` para producir el audio a procesar.
     """
     status = pyqtSignal(str)
     progress = pyqtSignal(int, str)
-    finished_ok = pyqtSignal(dict)   # {text, segments, language, language_probability, cancelled}
+    finished_ok = pyqtSignal(dict)
     finished_err = pyqtSignal(str)
 
-    def __init__(self, whisper, whisper_loaded, session_dir, lang):
+    def __init__(self, whisper, session_dir, lang):
         super().__init__()
         self.whisper = whisper
-        self.whisper_loaded = whisper_loaded
         self.session_dir = session_dir
         self.lang = lang
-        self.model_loaded = False
         self._active_procs = []
         self._cancelled = False
 
     def cancel(self):
-        """Solicita aborto cooperativo (mata FFmpeg + corta el loop de Whisper)."""
+        """Aborto cooperativo: mata FFmpeg y corta el bucle de Whisper."""
         self._cancelled = True
         self.kill_subprocesses()
-
-    def _get_input_path(self):
-        raise NotImplementedError
-
-    def _ffmpeg_input_args(self, input_path):
-        return []
-
-    def _cleanup_input(self, input_path):
-        pass
 
     def kill_subprocesses(self):
         for p in self._active_procs:
             if p.poll() is None:
                 try:
                     p.kill()
-                except Exception:
+                except OSError:
                     pass
+        self._active_procs.clear()
+
+    def _get_input_path(self):
+        raise NotImplementedError
+
+    def _ffmpeg_input_args(self):
+        return []
+
+    def _cleanup_input(self, input_path):
+        """Que hacer con el audio de origen al terminar. Por defecto, nada."""
+
+    def _convert(self, input_path, mp3, mono):
+        """Genera el mp3 para el usuario y el WAV mono 16 kHz para Whisper."""
+        extra = self._ffmpeg_input_args()
+        self._active_procs = [
+            subprocess.Popen(
+                [FFMPEG_BIN, "-y", "-i", input_path, *extra, "-b:a", "128k", mp3],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=NO_WINDOW,
+            ),
+            subprocess.Popen(
+                [FFMPEG_BIN, "-y", "-i", input_path, *extra, "-ac", "1", "-ar", "16000", mono],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=NO_WINDOW,
+            ),
+        ]
+        for p in list(self._active_procs):
+            p.wait()
         self._active_procs.clear()
 
     def run(self):
         input_path = None
-        mono = None
-        mp3 = None
+        mono = mp3 = None
         reached_transcribe = False
         try:
             input_path = self._get_input_path()
@@ -363,39 +450,24 @@ class _BaseTranscribeThread(QThread):
 
             mp3 = os.path.join(self.session_dir, "audio.mp3")
             mono = os.path.join(self.session_dir, "_mono.wav")
-            extra = self._ffmpeg_input_args(input_path)
 
             self.status.emit("Convirtiendo audio...")
-            self._active_procs = [
-                subprocess.Popen(
-                    [FFMPEG_BIN, "-y", "-i", input_path, *extra, "-b:a", "128k", mp3],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    creationflags=NO_WINDOW,
-                ),
-                subprocess.Popen(
-                    [FFMPEG_BIN, "-y", "-i", input_path, *extra, "-ac", "1", "-ar", "16000", mono],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    creationflags=NO_WINDOW,
-                ),
-            ]
-            for p in self._active_procs:
-                p.wait()
-            self._active_procs.clear()
+            self._convert(input_path, mp3, mono)
 
             if self._cancelled:
                 self.finished_err.emit("Cancelado")
                 return
-
             if not os.path.exists(mono):
-                self.finished_err.emit("Error: FFmpeg no pudo generar el audio para transcribir")
+                self.finished_err.emit(
+                    "FFmpeg no pudo procesar este audio. Puede estar dañado o en un "
+                    "formato no soportado."
+                )
                 return
             if not os.path.exists(mp3):
-                log.warning("FFmpeg no genero %s (sigue la transcripcion, pero no quedara audio.mp3)", mp3)
+                log.warning("FFmpeg no genero %s; sigo sin copia de audio", mp3)
 
-            if not self.whisper_loaded:
-                self.status.emit("Cargando modelo Whisper...")
-                self.whisper.load_model()
-                self.model_loaded = True
+            if not self.whisper.is_loaded:
+                self.status.emit("Preparando el modelo...")
 
             self.status.emit("Transcribiendo...")
             reached_transcribe = True
@@ -408,88 +480,80 @@ class _BaseTranscribeThread(QThread):
 
             if result.get("cancelled"):
                 self.finished_err.emit("Cancelado")
-            else:
-                if not result["text"]:
-                    result["text"] = (
-                        "No se detecto voz en el audio.\n\n"
-                        "Sugerencias:\n"
-                        "  - Verifica que el audio tenga voz humana, no solo musica o silencio.\n"
-                        "  - Reproducí el audio.mp3 (boton Audio) para confirmar que se grabo bien.\n"
-                        "  - Si grabaste del sistema, asegurate de que estaba sonando algo."
-                    )
-                self.finished_ok.emit(result)
+                return
 
+            if not result["text"]:
+                result["text"] = (
+                    "No se detecto voz en el audio.\n\n"
+                    "Sugerencias:\n"
+                    "  - Verifica que el audio tenga voz humana, no solo musica o silencio.\n"
+                    "  - Reproduci el audio.mp3 (boton Audio) para confirmar que se grabo bien.\n"
+                    "  - Si grabaste del sistema, asegurate de que estaba sonando algo."
+                )
+            self.finished_ok.emit(result)
+
+        except EngineCancelled:
+            self.finished_err.emit("Cancelado")
         except Exception as ex:
-            log.error("Error en procesamiento", exc_info=True)
+            log.error("Error en el procesamiento", exc_info=True)
             self.finished_err.emit(f"Error: {ex}")
         finally:
-            # 1) Matar FFmpeg si quedo vivo (cancel/error)
             self.kill_subprocesses()
-
-            # 2) Borrar SIEMPRE el WAV temporal de Whisper
-            if mono and os.path.exists(mono):
-                try:
-                    os.unlink(mono)
-                except OSError:
-                    pass
-
-            # 3) Si cancelamos antes de que arrancara Whisper, audio.mp3 quedo parcial -> borrar
-            if not reached_transcribe and mp3 and os.path.exists(mp3):
-                try:
-                    os.unlink(mp3)
-                except OSError:
-                    pass
-
-            # 4) Cleanup del input source (raw.wav para grabacion, no-op para upload)
+            # El WAV temporal de Whisper no se conserva nunca.
+            _unlink(mono)
+            # Si cancelamos antes de transcribir, el mp3 quedo a medias.
+            if not reached_transcribe:
+                _unlink(mp3)
             if input_path:
-                try:
-                    self._cleanup_input(input_path)
-                except OSError:
-                    pass
+                self._cleanup_input(input_path)
 
 
 class ProcessThread(_BaseTranscribeThread):
-    """Procesa una grabacion (loopback) recien terminada."""
+    """Procesa una grabacion recien terminada."""
 
-    def __init__(self, audio, whisper, whisper_loaded, session_dir, lang):
-        super().__init__(whisper, whisper_loaded, session_dir, lang)
+    def __init__(self, audio, whisper, session_dir, lang):
+        super().__init__(whisper, session_dir, lang)
         self.audio = audio
 
     def _get_input_path(self):
         return self.audio.stop_raw()
 
     def _cleanup_input(self, input_path):
-        try:
-            os.unlink(input_path)
-        except OSError as ex:
-            log.warning("No se pudo eliminar WAV: %s", ex)
+        # El WAV crudo es intermedio: se reemplaza por audio.mp3.
+        _unlink(input_path)
 
 
 class FileTranscribeThread(_BaseTranscribeThread):
-    """Transcribe un archivo de audio subido o arrastrado."""
+    """Transcribe un archivo subido o arrastrado. Nunca borra el original."""
 
-    def __init__(self, whisper, whisper_loaded, file_path, session_dir, lang):
-        super().__init__(whisper, whisper_loaded, session_dir, lang)
+    def __init__(self, whisper, file_path, session_dir, lang):
+        super().__init__(whisper, session_dir, lang)
         self.file_path = file_path
 
     def _get_input_path(self):
         return self.file_path
 
-    def _ffmpeg_input_args(self, input_path):
-        # Archivos pueden tener video; -vn descarta el track
+    def _ffmpeg_input_args(self):
+        # El archivo puede traer video; -vn descarta esa pista.
         return ["-vn"]
 
 
-# ── Single-instance lock (QLocalServer/Socket) ──
-def try_acquire_single_instance():
-    """Si ya hay otra instancia, le pide que muestre su ventana y devuelve False.
+def _unlink(path):
+    """Borra un archivo si existe, sin quejarse."""
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
-    True = somos la primera (o unica) instancia; podemos seguir.
-    False = otra instancia ya corre; debemos salir.
-    """
+
+# ── Instancia unica ──
+def try_acquire_single_instance():
+    """False si ya hay otra instancia (a la que se le pide que se muestre)."""
     sock = QLocalSocket()
     sock.connectToServer(SINGLE_INSTANCE_KEY)
-    if sock.waitForConnected(800):
+    if sock.waitForConnected(SOCKET_TIMEOUT_MS):
         try:
             sock.write(b"SHOW")
             sock.flush()
@@ -501,22 +565,20 @@ def try_acquire_single_instance():
 
 
 class SingleInstanceServer:
-    """Acepta conexiones de futuras instancias y trae la ventana al frente."""
+    """Escucha a instancias posteriores y trae la ventana al frente."""
 
     def __init__(self, window):
         self.window = window
         self.server = QLocalServer()
-        # Limpiar socket leftover de un crash anterior
+        # Limpiar un socket huerfano de un cierre anterior anormal.
         QLocalServer.removeServer(SINGLE_INSTANCE_KEY)
         if not self.server.listen(SINGLE_INSTANCE_KEY):
-            # Race: alguien gano la carrera entre nuestro try_acquire y este listen.
-            # Reintentamos try_acquire y si ahora SI hay otra, salimos limpiamente.
-            log.warning("listen() fallo: %s; reintentando deteccion", self.server.errorString())
+            log.warning("listen() fallo: %s; reintento la deteccion",
+                        self.server.errorString())
             if not try_acquire_single_instance():
-                log.info("Confirmado: otra instancia gano la carrera, saliendo")
+                log.info("Otra instancia gano la carrera; salgo")
                 QApplication.quit()
                 sys.exit(0)
-            # Si aun asi no hay otra, dejamos al daemon sin escuchar (modo degradado).
             return
         self.server.newConnection.connect(self._on_new)
 
@@ -525,24 +587,75 @@ class SingleInstanceServer:
         if sock is None:
             return
         try:
-            if sock.waitForReadyRead(500):
-                msg = bytes(sock.readAll().data())
-                if msg == b"SHOW":
-                    log.info("Otra instancia pidio mostrar la ventana")
-                    self.window.showNormal()
-                    self.window.activateWindow()
-                    self.window.raise_()
+            if sock.waitForReadyRead(500) and bytes(sock.readAll().data()) == b"SHOW":
+                log.info("Otra instancia pidio mostrar la ventana")
+                self.window.show_from_tray()
         finally:
             sock.disconnectFromServer()
 
+    def close(self):
+        self.server.close()
+        QLocalServer.removeServer(SINGLE_INSTANCE_KEY)
 
+
+# ── Hotkey global ──
+class GlobalHotkey(QAbstractNativeEventFilter):
+    """Atajo de teclado a nivel sistema mediante RegisterHotKey (Win32).
+
+    QShortcut solo funciona con la ventana enfocada, asi que no servia para el caso
+    que le da sentido al atajo: empezar a grabar con la app minimizada en la bandeja.
+    """
+
+    def __init__(self, callback):
+        super().__init__()
+        self._callback = callback
+        self.registered = False
+
+    def install(self, app):
+        if sys.platform != "win32":
+            return False
+        try:
+            ok = ctypes.windll.user32.RegisterHotKey(
+                None, HOTKEY_ID, _MOD_CONTROL | _MOD_SHIFT | _MOD_NOREPEAT, _VK_R
+            )
+        except Exception:
+            log.warning("RegisterHotKey no disponible", exc_info=True)
+            return False
+        if not ok:
+            # Tipicamente otra aplicacion ya se quedo con la combinacion.
+            log.warning("No se pudo registrar el atajo global %s", HOTKEY_TEXT)
+            return False
+        app.installNativeEventFilter(self)
+        self.registered = True
+        log.info("Atajo global %s registrado", HOTKEY_TEXT)
+        return True
+
+    def remove(self, app):
+        if not self.registered:
+            return
+        try:
+            app.removeNativeEventFilter(self)
+            ctypes.windll.user32.UnregisterHotKey(None, HOTKEY_ID)
+        except Exception:
+            log.warning("No se pudo liberar el atajo global", exc_info=True)
+        self.registered = False
+
+    def nativeEventFilter(self, eventType, message):
+        if eventType == b"windows_generic_MSG":
+            msg = ctypes.wintypes.MSG.from_address(int(message))
+            if msg.message == _WM_HOTKEY and msg.wParam == HOTKEY_ID:
+                self._callback()
+                return True, 0
+        return False, 0
+
+
+# ── Historial ──
 _DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-# Acepta 'transcripcion-N' y 'transcripcion-N (nombre custom)' (grupo 1 = el numero).
 _TRANSCRIPCION_DIR_RE = re.compile(r"^transcripcion-(\d+)( \(.+\))?$")
 
 
 class HistoryDialog(QDialog):
-    """Dialog que lista transcripciones pasadas (mas recientes arriba) y permite recargar / borrar."""
+    """Lista las transcripciones pasadas (mas recientes arriba) y permite recargarlas."""
 
     def __init__(self, output_dir, parent=None):
         super().__init__(parent)
@@ -554,7 +667,7 @@ class HistoryDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
 
-        info = QLabel("Doble click para cargar; click derecho para abrir carpeta o borrar.")
+        info = QLabel("Doble click para cargar; click derecho para abrir la carpeta o borrar.")
         info.setStyleSheet(f"color: {C_TEXT_DIM}; font-size: 12px;")
         layout.addWidget(info)
 
@@ -579,7 +692,8 @@ class HistoryDialog(QDialog):
         load_btn.clicked.connect(self._on_load)
         bottom.addWidget(load_btn)
         close_btn = QPushButton("Cerrar")
-        close_btn.setStyleSheet(_btn_outline(C_BORDER, C_BORDER_HI, C_TEXT_DIM, height=30, radius=8, font_size=11))
+        close_btn.setStyleSheet(_btn_outline(C_BORDER, C_BORDER_HI, C_TEXT_DIM,
+                                             height=30, radius=8, font_size=11))
         close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         close_btn.clicked.connect(self.reject)
         bottom.addWidget(close_btn)
@@ -590,11 +704,15 @@ class HistoryDialog(QDialog):
     def _populate(self):
         if not os.path.isdir(self.output_dir):
             return
-        date_dirs = sorted(
-            [d for d in os.listdir(self.output_dir)
-             if _DATE_DIR_RE.match(d) and os.path.isdir(os.path.join(self.output_dir, d))],
-            reverse=True,
-        )
+        try:
+            date_dirs = sorted(
+                (d for d in os.listdir(self.output_dir)
+                 if _DATE_DIR_RE.match(d)
+                 and os.path.isdir(os.path.join(self.output_dir, d))),
+                reverse=True,
+            )
+        except OSError:
+            return
         for date_dir in date_dirs:
             date_path = os.path.join(self.output_dir, date_dir)
             try:
@@ -603,18 +721,16 @@ class HistoryDialog(QDialog):
                             and os.path.isdir(os.path.join(date_path, s))]
             except OSError:
                 continue
-            sessions.sort(key=lambda x: int(_TRANSCRIPCION_DIR_RE.match(x).group(1)), reverse=True)
+            sessions.sort(key=lambda x: int(_TRANSCRIPCION_DIR_RE.match(x).group(1)),
+                          reverse=True)
             for s in sessions:
                 full = os.path.join(date_path, s)
-                preview = self._load_preview(full)
-                meta = self._metadata(full)
                 header = f"{date_dir}  -  {s}"
+                meta = self._metadata(full)
                 if meta:
                     header += f"   ({meta})"
-                label = header
-                if preview:
-                    label += f"\n   {preview}"
-                item = QListWidgetItem(label)
+                preview = self._load_preview(full)
+                item = QListWidgetItem(header + (f"\n   {preview}" if preview else ""))
                 item.setData(Qt.ItemDataRole.UserRole, full)
                 self.list_widget.addItem(item)
 
@@ -626,35 +742,26 @@ class HistoryDialog(QDialog):
         try:
             with open(txt, encoding="utf-8") as f:
                 content = f.read(max_chars + 20).replace("\n", " ").strip()
-            if len(content) > max_chars:
-                content = content[:max_chars] + "..."
-            return content
-        except Exception:
+            return content[:max_chars] + "..." if len(content) > max_chars else content
+        except OSError:
             return ""
 
     @staticmethod
     def _metadata(session_dir):
-        """Hora del audio + duracion estimada + indicador de SRT presente."""
+        """Hora del audio, duracion estimada e indicador de SRT."""
         bits = []
         mp3 = os.path.join(session_dir, "audio.mp3")
         if os.path.isfile(mp3):
             try:
                 mtime = datetime.datetime.fromtimestamp(os.path.getmtime(mp3))
                 bits.append(mtime.strftime("%H:%M"))
-            except OSError:
-                pass
-            try:
-                # Estimacion: 128 kbps mp3 = 16 KB/s
+                # A 128 kbps constantes, 1 segundo son 16 KB.
                 dur_sec = int(os.path.getsize(mp3) / 16000)
                 if dur_sec > 0:
                     m, s = divmod(dur_sec, 60)
                     h, m = divmod(m, 60)
-                    if h:
-                        bits.append(f"{h}h{m:02d}m")
-                    elif m:
-                        bits.append(f"{m}m{s:02d}s")
-                    else:
-                        bits.append(f"{s}s")
+                    bits.append(f"{h}h{m:02d}m" if h else
+                                (f"{m}m{s:02d}s" if m else f"{s}s"))
             except OSError:
                 pass
         if os.path.isfile(os.path.join(session_dir, "transcripcion.srt")):
@@ -682,109 +789,134 @@ class HistoryDialog(QDialog):
         menu.addSeparator()
         delete_act = menu.addAction("Borrar transcripcion...")
         chosen = menu.exec(self.list_widget.mapToGlobal(pos))
+
         if chosen == load_act:
             self.selected_dir = path
             self.accept()
         elif chosen == open_act:
-            try:
-                os.startfile(path)
-            except Exception:
-                pass
+            open_in_explorer(path)
         elif chosen == delete_act:
-            reply = QMessageBox.question(
-                self, "Borrar transcripcion",
-                f"¿Borrar permanentemente esta sesion?\n\n{os.path.basename(path)}\n\n"
-                "Se elimina la carpeta entera (audio.mp3 + transcripcion.txt + .srt si lo hay).",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if reply == QMessageBox.StandardButton.Yes:
-                shutil.rmtree(path, ignore_errors=True)
-                # Si la carpeta de fecha quedo vacia, tambien la borramos
-                date_dir = os.path.dirname(path)
-                try:
-                    if os.path.isdir(date_dir) and not os.listdir(date_dir):
-                        os.rmdir(date_dir)
-                except OSError:
-                    pass
-                row = self.list_widget.row(item)
-                self.list_widget.takeItem(row)
+            self._delete(item, path)
+
+    def _delete(self, item, path):
+        reply = QMessageBox.question(
+            self, "Borrar transcripcion",
+            f"¿Borrar permanentemente esta sesion?\n\n{os.path.basename(path)}\n\n"
+            "Se elimina la carpeta entera (audio.mp3 + transcripcion.txt + .srt si lo hay).",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        shutil.rmtree(path, ignore_errors=True)
+        date_dir = os.path.dirname(path)
+        try:
+            if os.path.isdir(date_dir) and not os.listdir(date_dir):
+                os.rmdir(date_dir)
+        except OSError:
+            pass
+        self.list_widget.takeItem(self.list_widget.row(item))
+
+
+def open_in_explorer(path):
+    """Abre una carpeta o archivo con la aplicacion asociada del sistema."""
+    try:
+        os.startfile(path)
+    except (OSError, AttributeError) as ex:
+        log.warning("No se pudo abrir %s: %s", path, ex)
 
 
 class TranscriberApp(QMainWindow):
     def __init__(self, app_icon=None):
         super().__init__()
-        log.info("Hardware: %s", hardware.hardware_summary())
+        self._hw = hardware.summary()
+        log.info("Hardware: %s", self._hw)
 
         self.audio = AudioCapture()
-        self.whisper = Transcriber(model_name=WHISPER_MODEL)
+        self.whisper = Transcriber()
+        self.settings = QSettings(paths.settings_ini_path(), QSettings.Format.IniFormat)
+
         self.is_recording = False
         self.is_paused = False
         self.is_processing = False
-        self._whisper_loaded = False
-        self._preload_error = None
+        self.current_text = ""
+
         self._session_dir = None
+        self._segments = []
+        self._text_dirty = False
         self._record_start = None
         self._pause_total = datetime.timedelta()
         self._pause_start = None
-        self.current_text = ""
-        self._segments = []
-        self._text_dirty = False
-        self._process_thread = None
-        self._file_thread = None
-        self._preload_thread = None
-        self._download_timer = None
-        self._transcribe_started_at = None
-        self._pending_name = None  # nombre opcional para la carpeta de la grabacion
+        self._pending_name = None
         self._file_queue = []
         self._queue_total = 0
-        self._allow_quit = False
+        self._quit_requested = False
+        self._capture_error_shown = False
+        self._transcribe_started_at = None
+        self._process_thread = None
+        self._file_thread = None
+        self._load_thread = None
+        self._download_timer = None
+        self._download_dir = None
+        self._download_target_mb = 0
         self._app_icon = app_icon or make_app_icon()
-
-        self.settings = QSettings(paths.settings_ini_path(), QSettings.Format.IniFormat)
+        self._hotkey = None
+        self._hotkey_shortcut = None
+        self._single_server = None
 
         self._init_ui()
         self._restore_settings()
         self._init_timer()
-        self._init_hotkey()
         self._init_tray()
         self.setAcceptDrops(True)
-        self._check_deps()
-        self._preload_whisper()
-        # Aviso (una vez) si vamos a transcribir en CPU: es mucho mas lento.
+        self._check_dependencies()
+        self._start_engine_load()
         QTimer.singleShot(800, self._maybe_warn_cpu)
 
     # ── Persistencia ──
     def _restore_settings(self):
-        defaults = {"language": "Español", "source": "Audio del sistema"}
-        for key, combo in (("language", self.lang_combo), ("source", self.source_combo)):
-            val = self.settings.value(key, type=str) or defaults[key]
-            idx = combo.findText(val)
+        defaults = {
+            config.SETTING_LANGUAGE: "Español",
+            config.SETTING_SOURCE: "Audio del sistema",
+            config.SETTING_MODEL: config.MODEL_AUTO,
+        }
+        combos = {
+            config.SETTING_LANGUAGE: self.lang_combo,
+            config.SETTING_SOURCE: self.source_combo,
+            config.SETTING_MODEL: self.model_combo,
+        }
+        for key, combo in combos.items():
+            value = self.settings.value(key, type=str) or defaults[key]
+            idx = combo.findText(value)
             if idx >= 0:
+                combo.blockSignals(True)
                 combo.setCurrentIndex(idx)
-        geom = self.settings.value("geometry")
+                combo.blockSignals(False)
+
+        self.whisper.set_preferred_model(self._selected_model())
+
+        geom = self.settings.value(config.SETTING_GEOMETRY)
         if geom is not None:
             try:
                 self.restoreGeometry(geom)
-            except Exception:
+            except (TypeError, ValueError):
                 pass
 
     def _save_settings(self):
-        self.settings.setValue("language", self.lang_combo.currentText())
-        self.settings.setValue("source", self.source_combo.currentText())
-        self.settings.setValue("geometry", self.saveGeometry())
+        self.settings.setValue(config.SETTING_LANGUAGE, self.lang_combo.currentText())
+        self.settings.setValue(config.SETTING_SOURCE, self.source_combo.currentText())
+        self.settings.setValue(config.SETTING_MODEL, self.model_combo.currentText())
+        self.settings.setValue(config.SETTING_GEOMETRY, self.saveGeometry())
 
-    def _on_lang_changed(self, text):
-        self.settings.setValue("language", text)
+    def _selected_model(self):
+        """Modelo elegido en la interfaz; None significa automatico."""
+        text = self.model_combo.currentText()
+        return None if text == config.MODEL_AUTO else text
 
-    def _on_source_changed(self, text):
-        self.settings.setValue("source", text)
-
-    # ── UI ──
+    # ── Construccion de la interfaz ──
     def _init_ui(self):
-        self.setWindowTitle("Transcriber")
-        self.resize(680, 520)
-        self.setMinimumSize(620, 400)
+        self.setWindowTitle(version.APP_NAME)
+        self._apply_adaptive_geometry()
         self.setStyleSheet(STYLE)
         self.setWindowIcon(self._app_icon)
 
@@ -795,310 +927,322 @@ class TranscriberApp(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # ── Header ──
+        layout.addWidget(self._build_header())
+        layout.addWidget(self._build_record_row())
+        layout.addWidget(self._build_options_row())
+        layout.addWidget(self._build_editor(), stretch=1)
+        layout.addWidget(self._build_progress_row())
+        layout.addWidget(self._build_footer())
+
+        # Parpadeo del punto rojo mientras se graba.
+        self._rec_pulse = QTimer(self)
+        self._rec_pulse.setInterval(600)
+        self._rec_pulse.timeout.connect(self._toggle_rec_dot)
+        self._rec_dot_visible = True
+
+    def _apply_adaptive_geometry(self):
+        """Tamano inicial proporcional a la pantalla.
+
+        Un tamano fijo se sale de pantalla en netbooks de 1366x768 y se ve diminuto
+        en un monitor 4K.
+        """
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            self.resize(680, 520)
+            return
+        available = screen.availableGeometry()
+        width = max(560, min(760, int(available.width() * 0.55)))
+        height = max(420, min(640, int(available.height() * 0.70)))
+        self.setMinimumSize(min(560, available.width() - 40),
+                            min(400, available.height() - 60))
+        self.resize(width, height)
+        self.move(available.center().x() - width // 2,
+                  available.center().y() - height // 2)
+
+    def _build_header(self):
         header = QWidget()
         header.setStyleSheet(f"background-color: {C_SURFACE}; border-bottom: 1px solid {C_BORDER};")
-        h_layout = QHBoxLayout(header)
-        h_layout.setContentsMargins(20, 12, 20, 12)
-        h_layout.setSpacing(10)
+        row = QHBoxLayout(header)
+        row.setContentsMargins(20, 12, 20, 12)
+        row.setSpacing(10)
 
-        # Logo + titulo
-        logo_label = QLabel()
-        logo_pm = QPixmap(22, 22)
-        logo_pm.fill(QColor(0, 0, 0, 0))
-        p = QPainter(logo_pm)
+        logo = QLabel()
+        pm = QPixmap(22, 22)
+        pm.fill(QColor(0, 0, 0, 0))
+        p = QPainter(pm)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setBrush(QColor(C_RED))
         p.setPen(Qt.PenStyle.NoPen)
         p.drawEllipse(0, 0, 22, 22)
         p.setPen(QColor("white"))
         p.setFont(QFont("Arial", 11, QFont.Weight.Bold))
-        p.drawText(logo_pm.rect(), Qt.AlignmentFlag.AlignCenter, "T")
+        p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "T")
         p.end()
-        logo_label.setPixmap(logo_pm)
-        h_layout.addWidget(logo_label)
+        logo.setPixmap(pm)
+        row.addWidget(logo)
 
-        title = QLabel("TRANSCRIBER")
-        title.setStyleSheet(f"color: {C_TEXT}; font-size: 14px; font-weight: bold; letter-spacing: 2px;")
-        h_layout.addWidget(title)
-
-        # Hardware badge en header (info estatica): GPU si CUDA, sino CPU
-        hw = hardware.hardware_summary()
-        if hw["cuda"]:
-            gpu_name = self._gpu_name() or "NVIDIA"
-            hw_text = f"GPU: {gpu_name}"
-            hw_style = S_CHIP_HW_GPU
-        else:
-            # Sin GPU NVIDIA -> CPU: badge en color de advertencia (ambar) para que se note.
-            hw_text = f"CPU (lento) - {hw['ram_gb']:.0f} GB RAM"
-            hw_style = S_CHIP_BUSY
-        self.hw_chip = QLabel(hw_text)
-        self.hw_chip.setStyleSheet(hw_style)
-        self.hw_chip.setToolTip(
-            f"Whisper corre en {WHISPER_DEVICE.upper()}\n"
-            f"Modelo: {WHISPER_MODEL}\n"
-            f"VRAM: {hw['vram_gb']:.1f} GB - RAM: {hw['ram_gb']:.1f} GB"
+        title = QLabel(version.APP_NAME.upper())
+        title.setStyleSheet(
+            f"color: {C_TEXT}; font-size: 14px; font-weight: bold; letter-spacing: 2px;"
         )
-        h_layout.addWidget(self.hw_chip)
+        row.addWidget(title)
 
-        h_layout.addStretch()
+        self.hw_chip = QLabel()
+        row.addWidget(self.hw_chip)
+        self._refresh_hw_chip()
 
-        # Indicador de grabacion (dot + timer)
+        row.addStretch()
+
         self.rec_dot = QLabel("●")
         self.rec_dot.setStyleSheet(f"color: {C_RED}; font-size: 18px;")
         self.rec_dot.hide()
-        h_layout.addWidget(self.rec_dot)
+        row.addWidget(self.rec_dot)
 
         self.timer_label = QLabel("")
         self.timer_label.setStyleSheet(
             f"color: {C_RED_HI}; font-size: 15px; font-weight: bold; "
             f"font-family: 'Consolas', monospace;"
         )
-        h_layout.addWidget(self.timer_label)
+        row.addWidget(self.timer_label)
 
-        # Status chip (color-coded)
-        self.status_chip = QLabel("Listo")
-        self.status_chip.setStyleSheet(S_CHIP_OK)
-        h_layout.addWidget(self.status_chip)
+        self.status_chip = QLabel("Iniciando...")
+        self.status_chip.setStyleSheet(S_CHIP_BUSY)
+        row.addWidget(self.status_chip)
+        return header
 
-        layout.addWidget(header)
+    def _refresh_hw_chip(self):
+        """Muestra donde va a correr Whisper. Se actualiza si el motor degrada."""
+        hw = self._hw
+        if self.whisper.device == "cuda":
+            text = f"GPU: {hw['gpu_short'] or 'NVIDIA'}"
+            style = S_CHIP_HW_GPU
+        else:
+            text = f"CPU (lento) - {hw['ram_gb']:.0f} GB RAM"
+            style = S_CHIP_BUSY
+        self.hw_chip.setText(text)
+        self.hw_chip.setStyleSheet(style)
+        self.hw_chip.setToolTip(
+            f"Motor: {self.whisper.describe()}\n"
+            f"VRAM: {hw['vram_gb']:.1f} GB - RAM: {hw['ram_gb']:.1f} GB"
+            + (f"\nDriver NVIDIA: {hw['driver']}" if hw["driver"] else "")
+        )
 
-        # ── Row 1: GRABAR (primario, grande) + Pausar/Detener (secundarios) ──
-        row1 = QWidget()
-        r1 = QHBoxLayout(row1)
-        r1.setContentsMargins(20, 14, 20, 6)
-        r1.setSpacing(8)
+    def _build_record_row(self):
+        row_widget = QWidget()
+        row = QHBoxLayout(row_widget)
+        row.setContentsMargins(20, 14, 20, 6)
+        row.setSpacing(8)
 
         self.rec_btn = QPushButton("GRABAR")
         self.rec_btn.setStyleSheet(S_REC)
         self.rec_btn.setMinimumWidth(140)
         self.rec_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.rec_btn.setToolTip("Grabar audio del sistema (loopback). Atajo: Ctrl+Shift+R")
+        self.rec_btn.setToolTip(f"Grabar audio del sistema. Atajo: {HOTKEY_TEXT}")
         self.rec_btn.clicked.connect(self._on_record)
-        if not self.audio.available:
-            self.rec_btn.setEnabled(False)
-            self.rec_btn.setStyleSheet(S_REC_DISABLED)
-            self.rec_btn.setToolTip("Grabacion loopback solo disponible en Windows")
-        r1.addWidget(self.rec_btn)
+        row.addWidget(self.rec_btn)
 
         self.pause_btn = QPushButton("PAUSAR")
         self.pause_btn.setStyleSheet(S_BTN_DISABLED)
         self.pause_btn.setEnabled(False)
         self.pause_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.pause_btn.clicked.connect(self._on_pause)
-        r1.addWidget(self.pause_btn)
+        row.addWidget(self.pause_btn)
 
         self.stop_btn = QPushButton("DETENER")
         self.stop_btn.setStyleSheet(S_BTN_DISABLED)
         self.stop_btn.setEnabled(False)
         self.stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.stop_btn.clicked.connect(self._on_stop)
-        r1.addWidget(self.stop_btn)
+        row.addWidget(self.stop_btn)
 
-        r1.addStretch()
+        row.addStretch()
 
-        # Fuente de audio: sistema (loopback) o microfono
-        src_label = QLabel("Fuente")
-        src_label.setStyleSheet(f"color: {C_TEXT_MUTED}; font-size: 11px; font-weight: 600;")
-        r1.addWidget(src_label)
+        label = QLabel("Fuente")
+        label.setStyleSheet(f"color: {C_TEXT_MUTED}; font-size: 11px; font-weight: 600;")
+        row.addWidget(label)
 
         self.source_combo = QComboBox()
         self.source_combo.addItems(AUDIO_SOURCES.keys())
         self.source_combo.setMinimumHeight(30)
-        self.source_combo.setMinimumWidth(140)
         self.source_combo.setToolTip(
-            "Audio del sistema: lo que escuchas por parlantes/auriculares (loopback).\n"
-            "Microfono: tu voz para dictado."
+            "Audio del sistema: lo que escuchas por parlantes o auriculares.\n"
+            "Microfono: tu voz, para dictado."
         )
-        self.source_combo.currentTextChanged.connect(self._on_source_changed)
-        r1.addWidget(self.source_combo)
+        self.source_combo.currentTextChanged.connect(
+            lambda text: self.settings.setValue(config.SETTING_SOURCE, text)
+        )
+        row.addWidget(self.source_combo)
+        return row_widget
 
-        layout.addWidget(row1)
-
-        # ── Row 2: SUBIR ARCHIVO + Idioma ──
-        row2 = QWidget()
-        r2 = QHBoxLayout(row2)
-        r2.setContentsMargins(20, 0, 20, 8)
-        r2.setSpacing(8)
+    def _build_options_row(self):
+        row_widget = QWidget()
+        row = QHBoxLayout(row_widget)
+        row.setContentsMargins(20, 0, 20, 8)
+        row.setSpacing(8)
 
         self.upload_btn = QPushButton("SUBIR ARCHIVO")
         self.upload_btn.setStyleSheet(S_UPLOAD)
         self.upload_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.upload_btn.setToolTip("Transcribir un archivo de audio o arrastralo a la ventana")
+        self.upload_btn.setToolTip("Transcribir archivos de audio, o arrastralos a la ventana")
         self.upload_btn.clicked.connect(self._on_upload)
-        r2.addWidget(self.upload_btn)
+        row.addWidget(self.upload_btn)
 
-        r2.addStretch()
+        row.addStretch()
+
+        model_label = QLabel("Modelo")
+        model_label.setStyleSheet(f"color: {C_TEXT_MUTED}; font-size: 11px; font-weight: 600;")
+        row.addWidget(model_label)
+
+        self.model_combo = QComboBox()
+        self.model_combo.addItem(config.MODEL_AUTO)
+        self.model_combo.addItems(hardware.MODEL_NAMES)
+        self.model_combo.setMinimumHeight(34)
+        self.model_combo.setToolTip(
+            f"{config.MODEL_AUTO}: elige el mejor modelo que tu equipo aguanta.\n"
+            "Modelos mas grandes transcriben mejor pero son mas lentos y pesan mas.\n"
+            "Si el elegido no entra en memoria, la app baja al siguiente sola."
+        )
+        # _on_model_changed ademas de persistir recarga el motor.
+        self.model_combo.currentTextChanged.connect(self._on_model_changed)
+        row.addWidget(self.model_combo)
+
 
         lang_label = QLabel("Idioma")
         lang_label.setStyleSheet(f"color: {C_TEXT_MUTED}; font-size: 11px; font-weight: 600;")
-        r2.addWidget(lang_label)
+        row.addWidget(lang_label)
 
         self.lang_combo = QComboBox()
         self.lang_combo.addItems(LANGUAGES.keys())
         self.lang_combo.setMinimumHeight(34)
         self.lang_combo.setToolTip(
-            "Idioma del audio que vas a transcribir.\n"
-            "Por defecto Espanol. Auto-detectar puede confundirse en audios cortos\n"
-            "(detecta es como pt). Si sabes el idioma, eligelo manualmente."
+            "Idioma del audio.\n"
+            "Auto-detectar puede confundirse en audios cortos (toma español por\n"
+            "portugués). Si sabes el idioma, elegilo a mano."
         )
-        self.lang_combo.currentTextChanged.connect(self._on_lang_changed)
-        r2.addWidget(self.lang_combo)
+        self.lang_combo.currentTextChanged.connect(
+            lambda text: self.settings.setValue(config.SETTING_LANGUAGE, text)
+        )
+        row.addWidget(self.lang_combo)
+        return row_widget
 
-        layout.addWidget(row2)
-
-        # ── Text area (editable) ──
+    def _build_editor(self):
         self.text_edit = QTextEdit()
-        self.text_edit.setReadOnly(False)
         self.text_edit.setPlaceholderText(
             "Arrastra un audio aqui, o usa GRABAR para capturar el audio del sistema, "
-            "o SUBIR ARCHIVO para transcribir un audio existente.\n\n"
-            "La transcripcion aparecera en este area y se guarda automaticamente. "
-            "Podes editarla y volver a guardar.\n\n"
-            "Tip: click derecho para opciones extra (exportar subtitulos, etc.)."
+            "o SUBIR ARCHIVO para transcribir audios existentes.\n\n"
+            "La transcripcion aparece en este area y se guarda sola. Podes editarla "
+            "y volver a guardar.\n\n"
+            "Tip: click derecho para exportar subtitulos (.srt)."
         )
         self.text_edit.textChanged.connect(self._on_text_changed)
-        # Menu contextual: opciones extra (exportar SRT, etc.)
         self.text_edit.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.text_edit.customContextMenuRequested.connect(self._show_text_context_menu)
-        te_container = QWidget()
-        te_layout = QVBoxLayout(te_container)
-        te_layout.setContentsMargins(20, 4, 20, 6)
-        te_layout.addWidget(self.text_edit)
-        layout.addWidget(te_container, stretch=1)
 
-        # ── Progress bar + Cancelar ──
-        prog_container = QWidget()
-        prog_layout = QHBoxLayout(prog_container)
-        prog_layout.setContentsMargins(20, 0, 20, 4)
-        prog_layout.setSpacing(8)
+        container = QWidget()
+        box = QVBoxLayout(container)
+        box.setContentsMargins(20, 4, 20, 6)
+        box.addWidget(self.text_edit)
+        return container
+
+    def _build_progress_row(self):
+        container = QWidget()
+        row = QHBoxLayout(container)
+        row.setContentsMargins(20, 0, 20, 4)
+        row.setSpacing(8)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
         self.progress_bar.setFixedHeight(14)
         self.progress_bar.setFormat("%p%")
         self.progress_bar.hide()
-        prog_layout.addWidget(self.progress_bar, stretch=1)
+        row.addWidget(self.progress_bar, stretch=1)
 
         self.cancel_btn = QPushButton("Cancelar")
-        self.cancel_btn.setStyleSheet(_btn_outline(C_RED, C_RED_HI, C_RED_HI, height=24, radius=8, font_size=10))
+        self.cancel_btn.setStyleSheet(
+            _btn_outline(C_RED, C_RED_HI, C_RED_HI, height=24, radius=8, font_size=10)
+        )
         self.cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.cancel_btn.setToolTip("Cancela la transcripcion en curso")
+        self.cancel_btn.setToolTip("Cancela la operacion en curso")
         self.cancel_btn.clicked.connect(self._on_cancel)
         self.cancel_btn.hide()
-        prog_layout.addWidget(self.cancel_btn)
+        row.addWidget(self.cancel_btn)
+        return container
 
-        layout.addWidget(prog_container)
-
-        # ── Footer ──
+    def _build_footer(self):
         footer = QWidget()
         footer.setStyleSheet(f"border-top: 1px solid {C_BORDER};")
-        f_layout = QHBoxLayout(footer)
-        f_layout.setContentsMargins(20, 10, 20, 12)
-        f_layout.setSpacing(6)
+        row = QHBoxLayout(footer)
+        row.setContentsMargins(20, 10, 20, 12)
+        row.setSpacing(6)
 
         self.play_btn = QPushButton("Audio")
-        self.play_btn.setStyleSheet(S_OPEN_DISABLED)
-        self.play_btn.setEnabled(False)
-        self.play_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.play_btn.setToolTip("Reproduce el audio.mp3 de la transcripcion actual")
         self.play_btn.clicked.connect(self._play_audio)
-        f_layout.addWidget(self.play_btn)
 
         self.save_btn = QPushButton("Guardar")
-        self.save_btn.setStyleSheet(S_OPEN_DISABLED)
-        self.save_btn.setEnabled(False)
-        self.save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.save_btn.setToolTip("Sobreescribe transcripcion.txt con el texto editado")
         self.save_btn.clicked.connect(self._save_edited)
-        f_layout.addWidget(self.save_btn)
 
         self.copy_btn = QPushButton("Copiar")
-        self.copy_btn.setStyleSheet(S_COPY_DISABLED)
-        self.copy_btn.setEnabled(False)
-        self.copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.copy_btn.setToolTip("Copia la seleccion, o todo el texto si no hay seleccion")
         self.copy_btn.clicked.connect(self._copy)
-        f_layout.addWidget(self.copy_btn)
 
         self.open_btn = QPushButton("Abrir")
-        self.open_btn.setStyleSheet(S_OPEN_DISABLED)
-        self.open_btn.setEnabled(False)
-        self.open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.open_btn.setToolTip("Abre la carpeta de la transcripcion actual (audio.mp3 + transcripcion.txt + .srt)")
+        self.open_btn.setToolTip("Abre la carpeta de la transcripcion actual")
         self.open_btn.clicked.connect(self._open_session)
-        f_layout.addWidget(self.open_btn)
 
-        f_layout.addStretch()
+        for btn in (self.play_btn, self.save_btn, self.copy_btn, self.open_btn):
+            btn.setEnabled(False)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            row.addWidget(btn)
+        self._disable_action_buttons()
 
-        # Chip de idioma detectado (visible solo cuando hay deteccion automatica)
+        row.addStretch()
+
         self.lang_chip = QLabel("")
         self.lang_chip.setStyleSheet(S_CHIP_HW)
         self.lang_chip.hide()
-        f_layout.addWidget(self.lang_chip)
+        row.addWidget(self.lang_chip)
 
         history_btn = QPushButton("Historial")
         history_btn.setStyleSheet(S_FOLDER)
         history_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         history_btn.setToolTip("Ver transcripciones pasadas")
         history_btn.clicked.connect(self._open_history)
-        f_layout.addWidget(history_btn)
-
-        layout.addWidget(footer)
-
-        # Pulso del rec_dot (parpadea cada 600ms mientras grabo)
-        self._rec_pulse = QTimer(self)
-        self._rec_pulse.setInterval(600)
-        self._rec_pulse.timeout.connect(self._toggle_rec_dot)
-        self._rec_dot_visible = True
-
-    @staticmethod
-    def _gpu_name():
-        """Nombre corto de la GPU primaria via nvidia-smi (e.g. 'RTX 5070'). Vacio si falla."""
-        try:
-            r = subprocess.run(
-                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-                capture_output=True, text=True, timeout=3,
-                creationflags=NO_WINDOW,
-            )
-            if r.returncode == 0:
-                name = r.stdout.strip().splitlines()[0]
-                # Acortar "NVIDIA GeForce RTX 5070" -> "RTX 5070"
-                for tok in ("RTX", "GTX", "Quadro", "Tesla", "RTX A"):
-                    if tok in name:
-                        idx = name.find(tok)
-                        return name[idx:]
-                return name
-        except Exception:
-            pass
-        return ""
-
-    def _toggle_rec_dot(self):
-        self._rec_dot_visible = not self._rec_dot_visible
-        self.rec_dot.setVisible(self._rec_dot_visible and self.is_recording and not self.is_paused)
+        row.addWidget(history_btn)
+        return footer
 
     def _init_timer(self):
-        self._timer = QTimer()
+        self._timer = QTimer(self)
         self._timer.timeout.connect(self._update_timer)
         self._timer.start(500)
 
-    def _init_hotkey(self):
-        shortcut = QShortcut(QKeySequence("Ctrl+Shift+R"), self)
-        shortcut.activated.connect(self._on_hotkey)
+    def attach_single_instance_server(self, server):
+        """Guarda el servidor de instancia unica para cerrarlo al salir."""
+        self._single_server = server
 
-    # ── System tray ──
+    def install_hotkey(self, app):
+        """Registra el atajo global; si no se puede, deja uno de ventana."""
+        self._hotkey = GlobalHotkey(self._on_hotkey)
+        if not self._hotkey.install(app):
+            self._hotkey = None
+            self._hotkey_shortcut = QShortcut(QKeySequence(HOTKEY_TEXT), self)
+            self._hotkey_shortcut.activated.connect(self._on_hotkey)
+            log.info("Usando atajo local (solo con la ventana enfocada)")
+
+    # ── Bandeja ──
     def _init_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
             self.tray = None
-            log.info("System tray no disponible")
+            log.info("La bandeja del sistema no esta disponible")
             return
 
         self.tray = QSystemTrayIcon(self._app_icon, self)
-        self.tray.setToolTip("Transcriber")
+        self.tray.setToolTip(version.APP_NAME)
 
         menu = QMenu()
         show_action = QAction("Mostrar", self)
-        show_action.triggered.connect(self._show_from_tray)
+        show_action.triggered.connect(self.show_from_tray)
         menu.addAction(show_action)
 
         record_action = QAction("Grabar / Detener", self)
@@ -1107,11 +1251,15 @@ class TranscriberApp(QMainWindow):
 
         menu.addSeparator()
 
+        about_action = QAction("Acerca de...", self)
+        about_action.triggered.connect(self._show_about)
+        menu.addAction(about_action)
+
         quit_action = QAction("Salir", self)
-        quit_action.triggered.connect(self._real_quit)
+        quit_action.triggered.connect(self._request_quit)
         menu.addAction(quit_action)
 
-        self._tray_menu = menu  # mantener referencia (Qt no aumenta refcount)
+        self._tray_menu = menu  # Qt no toma referencia propia del menu
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self._on_tray_activated)
         self.tray.show()
@@ -1121,136 +1269,176 @@ class TranscriberApp(QMainWindow):
             if self.isVisible():
                 self.hide()
             else:
-                self._show_from_tray()
+                self.show_from_tray()
         elif reason == QSystemTrayIcon.ActivationReason.DoubleClick:
-            self._show_from_tray()
+            self.show_from_tray()
 
-    def _show_from_tray(self):
+    def show_from_tray(self):
         self.showNormal()
         self.activateWindow()
         self.raise_()
 
-    def _real_quit(self):
-        self._allow_quit = True
-        self.close()
-        QApplication.quit()
+    def _show_about(self):
+        hw = self._hw
+        QMessageBox.information(
+            self, f"Acerca de {version.APP_NAME}",
+            f"<b>{version.APP_NAME} {version.__version__}</b><br>{version.APP_PUBLISHER}<br><br>"
+            f"<b>Motor:</b> {self.whisper.describe()}<br>"
+            f"<b>GPU:</b> {hw['gpu_name'] or 'no detectada'}<br>"
+            f"<b>RAM:</b> {hw['ram_gb']:.1f} GB<br><br>"
+            f"<b>Transcripciones:</b><br>{OUTPUT_DIR}<br><br>"
+            f"<b>Registro:</b><br>{paths.log_path()}",
+        )
 
-    def _check_deps(self):
+    def _request_quit(self):
+        """Salir de verdad. La confirmacion de grabacion la hace closeEvent."""
+        self._quit_requested = True
+        self.close()
+
+    # ── Dependencias y avisos ──
+    def _check_dependencies(self):
         if not FFMPEG_BIN:
-            self._set_status("FFmpeg no encontrado", error=True)
-            self.rec_btn.setEnabled(False)
-            self.rec_btn.setStyleSheet(S_REC_DISABLED)
-            self.upload_btn.setEnabled(False)
-            self.upload_btn.setStyleSheet(S_BTN_DISABLED)
-            log.error("FFmpeg no esta instalado o no esta en el PATH")
+            self._set_status("Falta FFmpeg", error=True)
+            log.error("FFmpeg no esta disponible")
             QMessageBox.critical(
-                self,
-                "FFmpeg no encontrado",
-                "Transcriber necesita FFmpeg para procesar audio.\n\n"
-                "Si descargaste la version portable, asegurate de que la carpeta 'bin' "
-                "este junto al ejecutable.\n\n"
-                "Si estas corriendo desde codigo fuente, instalalo con:\n"
+                self, "FFmpeg no encontrado",
+                f"{version.APP_NAME} necesita FFmpeg para procesar audio.\n\n"
+                "Si instalaste la app, reinstalala: la carpeta 'bin' debe estar "
+                "junto al ejecutable.\n\n"
+                "Si corres desde el codigo fuente, instalalo con:\n"
                 "    winget install Gyan.FFmpeg",
             )
         else:
             log.info("FFmpeg: %s", FFMPEG_BIN)
+
         if not self.audio.available:
-            log.info("Grabacion loopback no disponible (solo Windows)")
+            log.warning("Grabacion no disponible: %s", self.audio.init_error)
+            self.rec_btn.setToolTip(
+                "La grabacion no esta disponible en este equipo.\n"
+                "Revisa que el servicio de audio de Windows este activo.\n"
+                "Podes seguir transcribiendo archivos."
+            )
+        self._refresh_controls()
 
     def _maybe_warn_cpu(self):
-        """Si Whisper va a correr en CPU, avisa (una vez por PC). En CPU es mucho mas lento.
+        """Avisa una unica vez si Whisper va a correr en CPU."""
+        if self.whisper.device != "cpu":
+            return
+        if self.settings.value(config.SETTING_CPU_WARNING_SHOWN, False, type=bool):
+            return
 
-        Distingue dos casos:
-          - Hay GPU NVIDIA pero CUDA no carga  -> probable problema de drivers.
-          - No hay GPU NVIDIA                  -> CPU es lo unico disponible.
-        """
-        if WHISPER_DEVICE != "cpu":
-            return
-        if self.settings.value("cpu_warning_shown", False, type=bool):
-            return
-        gpu = self._gpu_name()
-        if gpu:
+        hw = self._hw
+        if hw["driver_too_old"]:
+            title = "Driver de NVIDIA desactualizado"
+            msg = (
+                f"Detectamos una {hw['gpu_short']}, pero el driver instalado "
+                f"({hw['driver']}) es anterior al que esa GPU necesita.\n\n"
+                "Actualizalo desde nvidia.com/drivers o GeForce Experience y volve "
+                "a abrir la app para transcribir mucho mas rapido.\n\n"
+                "Mientras tanto se usa la CPU."
+            )
+        elif hw["gpu_name"]:
             title = "GPU NVIDIA detectada, pero sin CUDA"
             msg = (
-                f"Se detecto una GPU NVIDIA ({gpu}), pero CUDA no esta disponible, "
-                "asi que Transcriber va a usar la CPU (mucho mas lento).\n\n"
-                "Solucion: actualiza los drivers de NVIDIA\n"
-                "(GeForce Experience o nvidia.com/drivers) y volve a abrir la app."
+                f"Detectamos una {hw['gpu_short']}, pero CUDA no esta disponible, "
+                "asi que se va a usar la CPU (mucho mas lento).\n\n"
+                "Suele resolverse actualizando los drivers de NVIDIA."
             )
         else:
-            title = "Sin GPU NVIDIA - modo CPU (lento)"
+            title = "Sin GPU NVIDIA: modo CPU"
             msg = (
-                "No se detecto una GPU NVIDIA en esta PC.\n\n"
-                "Transcriber funciona igual, pero transcribe en CPU, que es MUCHO mas lento "
-                "(una hora de audio puede tardar bastante).\n\n"
-                "Para que sea rapido se necesita una PC con tarjeta NVIDIA y sus drivers.\n\n"
-                f"Mientras tanto se eligio el modelo '{WHISPER_MODEL}' (mas liviano) para no demorar de mas."
+                "No detectamos una GPU NVIDIA en este equipo.\n\n"
+                f"{version.APP_NAME} funciona igual, pero transcribe en CPU, que es "
+                "bastante mas lento.\n\n"
+                f"Se eligio el modelo '{self.whisper.model_name}' para que no demore de mas."
             )
         QMessageBox.warning(self, title, msg)
-        self.settings.setValue("cpu_warning_shown", True)
+        self.settings.setValue(config.SETTING_CPU_WARNING_SHOWN, True)
 
-    # ── Preload del modelo ──
-    def _is_model_downloaded(self):
-        """Heuristica: dir del modelo existe y > 50 MB total = descargado."""
-        model_dir = os.path.join(
-            paths.models_dir(),
-            f"models--Systran--faster-whisper-{self.whisper.model_name}",
-        )
-        if not os.path.isdir(model_dir):
-            return False
-        total = 0
-        try:
-            for root, _, files in os.walk(model_dir):
-                for f in files:
-                    try:
-                        total += os.path.getsize(os.path.join(root, f))
-                    except OSError:
-                        pass
-                    if total > 50 * 1024 * 1024:
-                        return True
-        except Exception:
-            pass
-        return False
-
-    def _preload_whisper(self):
-        self._preload_error = None
-        self._download_timer = None
-        is_downloaded = self._is_model_downloaded()
-
-        if is_downloaded:
-            self._set_status(f"Cargando modelo {self.whisper.model_name}...")
+    # ── Carga del motor ──
+    def _start_engine_load(self):
+        """Carga el motor en segundo plano, mostrando el progreso de descarga."""
+        model = self.whisper.model_name
+        if is_model_downloaded(model):
+            self._set_status(f"Cargando {model}...")
         else:
-            target_mb = MODEL_SIZES_MB.get(self.whisper.model_name, 3000)
-            self._set_status(
-                f"Descargando modelo {self.whisper.model_name} ({target_mb} MB, una sola vez)..."
+            target_mb = hardware.MODEL_SIZES_MB.get(model, 3000)
+            self._set_status(f"Descargando modelo {model} ({target_mb} MB, una sola vez)...")
+            self._start_download_monitor(model, target_mb)
+
+        self._load_thread = ModelLoadThread(self.whisper)
+        self._load_thread.attempt.connect(self._on_engine_attempt)
+        self._load_thread.done.connect(self._on_engine_loaded)
+        self._load_thread.start()
+        self._refresh_controls()
+
+    def _on_engine_attempt(self, model_name, device):
+        """La carga cambio de candidato: puede implicar otra descarga."""
+        where = "GPU" if device == "cuda" else "CPU"
+        self._set_status(f"Preparando {model_name} en {where}...")
+        if not is_model_downloaded(model_name):
+            self._start_download_monitor(
+                model_name, hardware.MODEL_SIZES_MB.get(model_name, 3000)
             )
-            self._start_download_monitor(target_mb)
+        else:
+            self._stop_download_monitor()
 
-        self._preload_thread = QThread()
-        self._preload_thread.run = self._do_preload
-        self._preload_thread.finished.connect(self._on_preload_done)
-        self._preload_thread.start()
+    def _on_engine_loaded(self, error):
+        self._load_thread = None
+        self._stop_download_monitor()
+        self._refresh_controls()
 
-    def _start_download_monitor(self, target_mb):
-        """Polea el tamano del dir del modelo cada 800ms para mostrar progreso."""
-        self._download_target_mb = target_mb
-        self._download_dir = os.path.join(
-            paths.models_dir(),
-            f"models--Systran--faster-whisper-{self.whisper.model_name}",
-        )
+        if error == "cancelado":
+            self._set_status("Carga cancelada")
+            return
+        if error:
+            self._set_status("No se pudo cargar el modelo", error=True)
+            QMessageBox.critical(
+                self, "No se pudo cargar el modelo",
+                "No se pudo iniciar el motor de transcripcion en este equipo.\n\n"
+                f"{error}\n\n"
+                f"El detalle esta en:\n{paths.log_path()}",
+            )
+            return
+
+        self._refresh_hw_chip()
+        self._set_status("Listo")
+        log.info("Motor listo: %s", self.whisper.describe())
+        # El motor pudo degradar a un modelo distinto del pedido: limpiamos el
+        # cache recien ahora, sabiendo cual quedo realmente en uso.
+        try:
+            state.cleanup_model_cache(self.whisper.model_name)
+        except OSError as ex:
+            log.warning("No se pudo limpiar el cache de modelos: %s", ex)
+
+    def _on_model_changed(self, text):
+        """El usuario eligio otro modelo: se recarga el motor en caliente."""
+        self.settings.setValue(config.SETTING_MODEL, text)
+        # El selector esta deshabilitado mientras se graba, se procesa o se carga,
+        # asi que esto es una red de contencion por si la senal llega igual.
+        if self.is_recording or self.is_processing or self._load_thread is not None:
+            return
+        if self.whisper.set_preferred_model(self._selected_model()):
+            self._start_engine_load()
+
+    def _start_download_monitor(self, model_name, target_mb):
+        """Sondea el tamano del directorio del modelo para mostrar la descarga."""
+        self._download_dir = paths.model_cache_dir(model_name)
+        self._download_target_mb = max(1, target_mb)
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
         self.progress_bar.setFormat(f"0 / {target_mb} MB")
         self.progress_bar.show()
 
-        self._download_timer = QTimer(self)
-        self._download_timer.setInterval(800)
-        self._download_timer.timeout.connect(self._poll_download)
+        if self._download_timer is None:
+            self._download_timer = QTimer(self)
+            self._download_timer.setInterval(800)
+            self._download_timer.timeout.connect(self._poll_download)
         self._download_timer.start()
 
     def _poll_download(self):
-        """Lee el tamano del dir y actualiza la barra."""
-        if not os.path.isdir(self._download_dir):
+        if not self._download_dir or not os.path.isdir(self._download_dir):
             return
         total = 0
         try:
@@ -1260,281 +1448,268 @@ class TranscriberApp(QMainWindow):
                         total += os.path.getsize(os.path.join(root, f))
                     except OSError:
                         pass
-        except Exception:
+        except OSError:
             return
         mb = int(total / 1024 / 1024)
-        pct = min(int(mb / self._download_target_mb * 100), 99)
-        self.progress_bar.setValue(pct)
+        self.progress_bar.setValue(min(int(mb / self._download_target_mb * 100), 99))
         self.progress_bar.setFormat(f"{mb} / {self._download_target_mb} MB")
 
     def _stop_download_monitor(self):
         if self._download_timer is not None:
             self._download_timer.stop()
-            self._download_timer.deleteLater()
-            self._download_timer = None
-        self.progress_bar.hide()
-        self.progress_bar.setFormat("%p%")  # restablecer formato para transcripcion
+        self._download_dir = None
+        if not self.is_processing:
+            self.progress_bar.hide()
+        self.progress_bar.setFormat("%p%")
 
-    def _do_preload(self):
-        try:
-            self.whisper.load_model()
-        except Exception as ex:
-            log.error("Error precargando Whisper: %s", ex, exc_info=True)
-            self._preload_error = str(ex)
-
-    def _on_preload_done(self):
-        self._preload_thread = None
-        self._stop_download_monitor()
-        if self._preload_error:
-            self._whisper_loaded = False
-            self._set_status("Error cargando modelo", error=True)
-            QMessageBox.critical(
-                self,
-                "Error cargando modelo Whisper",
-                f"No se pudo cargar el modelo {self.whisper.model_name}.\n\n"
-                f"{self._preload_error}\n\n"
-                "Verifica el log en %LOCALAPPDATA%\\Transcriber\\transcriber.log.",
-            )
-            return
-        self._whisper_loaded = True
-        self._set_status("Listo")
-        log.info("Modelo Whisper precargado")
-
+    # ── Estado y controles ──
     def _set_status(self, text, error=False):
-        """Status chip color-coded segun el contenido."""
         self.status_chip.setText(text)
         if error:
             self.status_chip.setStyleSheet(S_CHIP_ERR)
-        elif text in ("Listo",) or text.startswith(("Copiad", "Guardado")):
+        elif text == "Listo" or text.startswith(("Copiad", "Guardado")):
             self.status_chip.setStyleSheet(S_CHIP_OK)
-        elif text.startswith(("Grabando", "Procesando", "Convirtiendo", "Cargando", "Transcribiendo", "Pausado", "Cancelando")):
+        elif text.startswith(("Grabando", "Procesando", "Convirtiendo", "Cargando",
+                              "Descargando", "Preparando", "Transcribiendo", "Pausado",
+                              "Cancelando")):
             self.status_chip.setStyleSheet(S_CHIP_BUSY)
         else:
             self.status_chip.setStyleSheet(S_CHIP)
-        # Mantener titulo de ventana y tray sincronizados con el estado
         self._update_window_title()
         self._update_tray_tooltip()
 
+    def _refresh_controls(self):
+        """Unico lugar que decide si los controles principales estan habilitados."""
+        busy = self.is_recording or self.is_processing
+        loading = self._load_thread is not None
+        can_record = not busy and self.audio.available and bool(FFMPEG_BIN)
+        can_upload = not busy and bool(FFMPEG_BIN)
+
+        self.rec_btn.setEnabled(can_record)
+        self.rec_btn.setStyleSheet(
+            S_REC_OFF if self.is_recording else (S_REC if can_record else S_REC_DISABLED)
+        )
+        self.upload_btn.setEnabled(can_upload)
+        self.upload_btn.setStyleSheet(S_UPLOAD if can_upload else S_BTN_DISABLED)
+
+        self.pause_btn.setEnabled(self.is_recording)
+        self.pause_btn.setStyleSheet(
+            (S_RESUME if self.is_paused else S_PAUSE) if self.is_recording else S_BTN_DISABLED
+        )
+        self.pause_btn.setText("REANUDAR" if self.is_paused else "PAUSAR")
+
+        self.stop_btn.setEnabled(self.is_recording)
+        self.stop_btn.setStyleSheet(S_STOP if self.is_recording else S_BTN_DISABLED)
+
+        self.lang_combo.setEnabled(not busy)
+        self.source_combo.setEnabled(not busy)
+        # Cambiar de modelo mientras se carga uno dejaria dos cargas compitiendo por
+        # el mismo motor, asi que el selector espera a que termine.
+        self.model_combo.setEnabled(not busy and not loading)
+
+    def _disable_action_buttons(self):
+        for btn, style in ((self.open_btn, S_OPEN_DISABLED),
+                           (self.copy_btn, S_COPY_DISABLED),
+                           (self.play_btn, S_OPEN_DISABLED),
+                           (self.save_btn, S_OPEN_DISABLED)):
+            btn.setEnabled(False)
+            btn.setStyleSheet(style)
+
+    def _enable_action_buttons(self):
+        self.open_btn.setEnabled(True)
+        self.open_btn.setStyleSheet(S_OPEN)
+        self.copy_btn.setEnabled(True)
+        self.copy_btn.setStyleSheet(S_COPY)
+        if self._session_dir and os.path.exists(os.path.join(self._session_dir, "audio.mp3")):
+            self.play_btn.setEnabled(True)
+            self.play_btn.setStyleSheet(S_OPEN)
+        self._refresh_save_btn()
+
+    def _refresh_save_btn(self):
+        can_save = bool(self._session_dir) and self._text_dirty and not self.is_processing
+        self.save_btn.setEnabled(can_save)
+        self.save_btn.setStyleSheet(S_OPEN if can_save else S_OPEN_DISABLED)
+
     @staticmethod
     def _short_device(name):
-        """Acorta nombres largos de devices: 'Speakers (Realtek(R) Audio) [Loopback]' -> 'Speakers (Realtek)'"""
+        """'Speakers (Realtek(R) Audio) [Loopback]' -> 'Speakers (Realtek(R) Audio)'."""
         if not name:
             return ""
-        # Sacar el sufijo [Loopback] si existe
         cut = name.split(" [")[0].strip()
-        # Si tiene parentesis con marca y modelo, quedarnos con la primera coma o (R)
         if len(cut) > 32:
             cut = cut[:32].rsplit(" ", 1)[0] + "..."
         return cut
 
     @staticmethod
     def _fmt_hms(total_seconds, force_hours=False):
-        """Segundos -> 'HH:MM:SS' (o 'MM:SS' si dura menos de 1h y no se fuerza la hora)."""
         secs = max(0, int(total_seconds))
         m, s = divmod(secs, 60)
         h, m = divmod(m, 60)
-        if h or force_hours:
-            return f"{h:02d}:{m:02d}:{s:02d}"
-        return f"{m:02d}:{s:02d}"
+        return f"{h:02d}:{m:02d}:{s:02d}" if (h or force_hours) else f"{m:02d}:{s:02d}"
+
+    def _elapsed(self):
+        if not self._record_start:
+            return datetime.timedelta()
+        return datetime.datetime.now() - self._record_start - self._pause_total
 
     def _update_window_title(self):
-        """Titulo contextual: estado actual + indicador de unsaved."""
-        base = "Transcriber"
         suffix = ""
-        if self.is_recording and self._record_start:
-            elapsed = datetime.datetime.now() - self._record_start - self._pause_total
-            suffix = f"Grabando {self._fmt_hms(elapsed.total_seconds())}"
+        if self.is_recording:
+            suffix = f"Grabando {self._fmt_hms(self._elapsed().total_seconds())}"
         elif self.is_processing:
             suffix = "Procesando"
         elif self._session_dir:
             try:
-                rel = os.path.relpath(self._session_dir, OUTPUT_DIR)
-                suffix = rel.replace(os.sep, "/")
+                suffix = os.path.relpath(self._session_dir, OUTPUT_DIR).replace(os.sep, "/")
             except ValueError:
                 pass
-        dirty = "*" if self._text_dirty else ""
-        title = f"{base}{dirty}" + (f" - {suffix}" if suffix else "")
+        title = version.APP_NAME + ("*" if self._text_dirty else "")
+        if suffix:
+            title += f" - {suffix}"
         if self.windowTitle() != title:
             self.setWindowTitle(title)
 
     def _update_tray_tooltip(self):
-        """Tooltip del tray sigue el estado actual."""
         if not self.tray:
             return
-        if self.is_recording and self._record_start:
-            elapsed = datetime.datetime.now() - self._record_start - self._pause_total
-            self.tray.setToolTip(f"Transcriber - Grabando {self._fmt_hms(elapsed.total_seconds())}")
+        if self.is_recording:
+            text = f"{version.APP_NAME} - Grabando {self._fmt_hms(self._elapsed().total_seconds())}"
         elif self.is_processing:
-            self.tray.setToolTip("Transcriber - Procesando")
+            text = f"{version.APP_NAME} - Procesando"
         else:
-            self.tray.setToolTip("Transcriber - Listo")
+            text = f"{version.APP_NAME} - Listo"
+        self.tray.setToolTip(text)
 
-    def _set_busy(self, busy):
-        rec_ok = not busy and self.audio.available and bool(FFMPEG_BIN)
-        upload_ok = not busy and bool(FFMPEG_BIN)
-        self.rec_btn.setEnabled(rec_ok)
-        self.rec_btn.setStyleSheet(S_REC if rec_ok else S_REC_DISABLED)
-        self.upload_btn.setEnabled(upload_ok)
-        self.upload_btn.setStyleSheet(S_UPLOAD if upload_ok else S_BTN_DISABLED)
-        self.lang_combo.setEnabled(not busy)
+    def _toggle_rec_dot(self):
+        self._rec_dot_visible = not self._rec_dot_visible
+        self.rec_dot.setVisible(self._rec_dot_visible and self.is_recording and not self.is_paused)
 
-    # ── Timer / hotkey ──
     def _update_timer(self):
-        if self.is_recording and self._record_start and not self.is_paused:
-            # Auto-detener si alcanzamos limite WAV 4GB
-            if getattr(self.audio, "_size_limit_hit", False):
-                self._set_status("Limite 4GB alcanzado, deteniendo", error=True)
-                QMessageBox.warning(
-                    self, "Limite de archivo alcanzado",
-                    "La grabacion supero el limite del formato WAV (~4 GB).\n"
-                    "Se detuvo automaticamente y se procesara el audio capturado hasta ahora.",
-                )
-                self._on_stop()
-                return
-            # Auto-detener si hubo un error de disco al grabar (p.ej. disco lleno)
-            if getattr(self.audio, "_disk_error", False):
-                self._set_status("Error de disco, deteniendo", error=True)
-                QMessageBox.warning(
-                    self, "Error al guardar el audio",
-                    "Se detuvo la grabacion porque hubo un error al escribir el audio "
-                    "(posible disco lleno).\n\n"
-                    "Se procesara lo capturado hasta ahora. Libera espacio antes de volver a grabar.",
-                )
-                self._on_stop()
-                return
-            elapsed = datetime.datetime.now() - self._record_start - self._pause_total
-            self.timer_label.setText(self._fmt_hms(elapsed.total_seconds(), force_hours=True))
-            # Mantener titulo y tray actualizados con el tiempo
-            self._update_window_title()
-            self._update_tray_tooltip()
+        if not (self.is_recording and not self.is_paused):
+            return
+        if self._check_capture_error():
+            return
+        self.timer_label.setText(self._fmt_hms(self._elapsed().total_seconds(), force_hours=True))
+        self._update_window_title()
+        self._update_tray_tooltip()
 
-    def _confirm_discard_unsaved(self):
-        """True si no hay edits o el usuario confirma descartarlos."""
-        if not self._text_dirty:
-            return True
-        reply = QMessageBox.question(
-            self, "Cambios sin guardar",
-            "Tenes ediciones sin guardar en la transcripcion actual.\n\n"
-            "Si continuas, los cambios se perderan.\n\n"
-            "Click en 'Cancelar' y luego en 'Guardar' si los queres conservar.",
-            QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
-        )
-        return reply == QMessageBox.StandardButton.Discard
+    def _check_capture_error(self):
+        """Detiene la grabacion si la captura fallo. True si hubo error.
 
+        `_capture_error_shown` evita una cascada: el QMessageBox corre un bucle de
+        eventos anidado, con lo que este mismo timer vuelve a entrar cada 500 ms y
+        antes apilaba un dialogo nuevo cada vez.
+        """
+        if self._capture_error_shown:
+            return False
+        if self.audio.size_limit_hit:
+            title = "Limite de tamano alcanzado"
+            body = ("La grabacion supero el limite del formato WAV (~4 GB).\n\n"
+                    "Se detuvo sola y se procesa lo capturado hasta ahora.")
+        elif self.audio.disk_error:
+            title = "Error al guardar el audio"
+            body = ("Se detuvo la grabacion porque no se pudo escribir el audio "
+                    "(probablemente el disco esta lleno).\n\n"
+                    "Se procesa lo capturado hasta ahora. Libera espacio antes de "
+                    "volver a grabar.")
+        else:
+            return False
+
+        self._capture_error_shown = True
+        self._set_status("Grabacion detenida por un error", error=True)
+        # Primero se ordena el estado y despues se avisa: al abrir el dialogo,
+        # is_recording ya es False y el timer no puede reentrar.
+        self._on_stop(ask_name=False)
+        QMessageBox.warning(self, title, body)
+        return True
+
+    # ── Sesiones ──
+    def _create_session_dir(self):
+        """Crea la carpeta de la sesion, o informa el problema y devuelve None.
+
+        Unico punto de creacion: lo usan tanto la grabacion como la subida. Antes
+        estaba duplicado y sin proteger, y una excepcion aca aborta el proceso
+        entero porque corre dentro de un slot de Qt.
+        """
+        try:
+            return state.make_session_folder()
+        except OSError as ex:
+            log.error("No se pudo crear la carpeta de la sesion: %s", ex)
+            QMessageBox.critical(
+                self, "No se pudo crear la carpeta",
+                f"No se pudo crear la carpeta para esta transcripcion.\n\n{ex}\n\n"
+                f"Carpeta de destino:\n{OUTPUT_DIR}",
+            )
+            self._set_status("No se pudo crear la carpeta", error=True)
+            return None
+
+    def _cleanup_empty_session_dir(self):
+        """Borra la carpeta de la sesion si no quedo nada util adentro."""
+        if not self._session_dir or not os.path.isdir(self._session_dir):
+            return
+        if state.session_has_content(self._session_dir):
+            return
+        shutil.rmtree(self._session_dir, ignore_errors=True)
+        log.info("Eliminada carpeta de sesion vacia: %s", self._session_dir)
+        self._session_dir = None
+
+    # ── Grabacion ──
     def _on_hotkey(self):
         if self.is_processing:
             return
         if self.is_recording:
             self._on_stop()
         elif self.audio.available:
+            self.show_from_tray()
             self._on_record()
 
-    # ── Drag and drop ──
-    @staticmethod
-    def _is_audio_path(p):
-        return p and p.lower().endswith(AUDIO_EXTS)
-
-    def dragEnterEvent(self, event):
-        # Por defecto no estamos en drop-target
-        accept = False
-        if not (self.is_recording or self.is_processing or not FFMPEG_BIN):
-            md = event.mimeData()
-            if md.hasUrls():
-                for url in md.urls():
-                    if url.isLocalFile() and self._is_audio_path(url.toLocalFile()):
-                        accept = True
-                        break
-        if accept:
-            event.acceptProposedAction()
-            self._set_drop_target(True)
-        else:
-            self._set_drop_target(False)
-            event.ignore()
-
-    def dragLeaveEvent(self, event):
-        self._set_drop_target(False)
-        super().dragLeaveEvent(event)
-
-    def dropEvent(self, event):
-        self._set_drop_target(False)
-        dropped = []
-        for url in event.mimeData().urls():
-            if url.isLocalFile():
-                p = url.toLocalFile()
-                if self._is_audio_path(p):
-                    dropped.append(p)
-        if dropped:
-            event.acceptProposedAction()
-            self._show_from_tray()
-            if not self._confirm_discard_unsaved():
-                return
-            self._start_file_queue(dropped)
-        else:
-            event.ignore()
-
-    def _set_drop_target(self, active):
-        """Resalta el text area cuando hay un audio arrastrandose encima."""
-        self.text_edit.setProperty("droptarget", "true" if active else "false")
-        self.text_edit.style().unpolish(self.text_edit)
-        self.text_edit.style().polish(self.text_edit)
-
-    # ── Record ──
     def _on_record(self):
-        if self.is_recording or self.is_processing or not FFMPEG_BIN or not self.audio.available:
+        if self.is_recording or self.is_processing:
+            return
+        if not FFMPEG_BIN or not self.audio.available:
             return
         if not self._confirm_discard_unsaved():
             return
 
-        session_dir = state.make_session_folder()
-        if len(session_dir) > MAX_SESSION_DIR_LEN:
-            log.error("Path de sesion muy largo (%d chars): %s", len(session_dir), session_dir)
-            QMessageBox.warning(
-                self, "Path muy largo",
-                f"La carpeta de transcripciones esta demasiado adentro del filesystem ({len(session_dir)} caracteres).\n\n"
-                "Movela a una ruta mas corta (ej: C:\\Transcriber\\).",
-            )
-            shutil.rmtree(session_dir, ignore_errors=True)
+        session_dir = self._create_session_dir()
+        if not session_dir:
             return
 
         source = AUDIO_SOURCES.get(self.source_combo.currentText(), SOURCE_LOOPBACK)
         try:
             self.audio.start(os.path.join(session_dir, "_raw.wav"), source=source)
         except Exception as ex:
-            log.error("Error al iniciar grabacion: %s", ex)
+            log.error("No se pudo iniciar la grabacion: %s", ex)
             shutil.rmtree(session_dir, ignore_errors=True)
-            self._set_status(f"Error: {ex}", error=True)
+            self._set_status(f"{ex}", error=True)
+            QMessageBox.warning(self, "No se pudo grabar", str(ex))
             return
 
         self._session_dir = session_dir
         self.is_recording = True
         self.is_paused = False
+        self._capture_error_shown = False
         self._record_start = datetime.datetime.now()
         self._pause_total = datetime.timedelta()
         self._pause_start = None
         self.current_text = ""
-        self.text_edit.clear()
-        self.timer_label.setText("00:00:00")
-
         self._segments = []
         self._text_dirty = False
+
+        self.text_edit.blockSignals(True)
+        self.text_edit.clear()
+        self.text_edit.blockSignals(False)
+        self.timer_label.setText("00:00:00")
         self.lang_chip.hide()
 
-        self.rec_btn.setEnabled(False)
-        self.rec_btn.setStyleSheet(S_REC_OFF)
-        self.upload_btn.setEnabled(False)
-        self.upload_btn.setStyleSheet(S_BTN_DISABLED)
-        self.pause_btn.setEnabled(True)
-        self.pause_btn.setStyleSheet(S_PAUSE)
-        self.pause_btn.setText("PAUSAR")
-        self.stop_btn.setEnabled(True)
-        self.stop_btn.setStyleSheet(S_STOP)
         self._disable_action_buttons()
+        self._refresh_controls()
         self.rec_dot.show()
         self._rec_dot_visible = True
         self._rec_pulse.start()
-        dev = self._short_device(getattr(self.audio, "device_name", ""))
-        self._set_status(f"Grabando ({dev})" if dev else "Grabando...")
+
+        device = self._short_device(self.audio.device_name)
+        self._set_status(f"Grabando ({device})" if device else "Grabando...")
 
     def _on_pause(self):
         if not self.is_recording:
@@ -1543,8 +1718,6 @@ class TranscriberApp(QMainWindow):
             self.is_paused = True
             self._pause_start = datetime.datetime.now()
             self.audio.pause()
-            self.pause_btn.setText("REANUDAR")
-            self.pause_btn.setStyleSheet(S_RESUME)
             self.rec_dot.hide()
             self._rec_pulse.stop()
             self._set_status("Pausado")
@@ -1554,45 +1727,76 @@ class TranscriberApp(QMainWindow):
                 self._pause_total += datetime.datetime.now() - self._pause_start
                 self._pause_start = None
             self.audio.resume()
-            self.pause_btn.setText("PAUSAR")
-            self.pause_btn.setStyleSheet(S_PAUSE)
             self.rec_dot.show()
             self._rec_dot_visible = True
             self._rec_pulse.start()
             self._set_status("Grabando...")
+        self._refresh_controls()
 
-    def _on_stop(self):
+    def _on_stop(self, ask_name=True):
         if not self.is_recording or self.is_processing:
             return
+        if not self._session_dir:
+            # No deberia pasar (_on_record siempre la crea), pero seguir sin
+            # carpeta destino haria fallar el hilo de procesamiento.
+            log.error("Se pidio detener sin carpeta de sesion activa")
+            self.is_recording = False
+            self._refresh_controls()
+            return
 
-        # Congelar la captura mientras se pide el nombre (no grabar mientras escribe).
+        # Congelar la captura mientras se pide el nombre.
         self.audio.pause()
         self.rec_dot.hide()
         self._rec_pulse.stop()
-        # Pedir nombre opcional para la carpeta de esta grabacion.
-        self._pending_name = self._ask_session_name()
 
         self.is_recording = False
-        self.is_processing = True
         self.is_paused = False
+        self._pending_name = self._ask_session_name() if ask_name else None
 
-        self.stop_btn.setEnabled(False)
-        self.stop_btn.setStyleSheet(S_BTN_DISABLED)
-        self.pause_btn.setEnabled(False)
-        self.pause_btn.setStyleSheet(S_BTN_DISABLED)
-        self.pause_btn.setText("PAUSAR")
+        self.is_processing = True
+        self._refresh_controls()
         self._set_status("Procesando...")
         self.timer_label.setText("")
 
-        lang = LANGUAGES.get(self.lang_combo.currentText())
-        self._process_thread = ProcessThread(
-            self.audio, self.whisper, self._whisper_loaded, self._session_dir, lang,
+        thread = ProcessThread(
+            self.audio, self.whisper, self._session_dir,
+            LANGUAGES.get(self.lang_combo.currentText()),
         )
-        self._wire_thread(self._process_thread, on_done=self._on_thread_done)
+        self._process_thread = thread
+        self._wire_thread(thread, self._on_process_thread_done)
         self._start_busy_progress()
-        self._process_thread.start()
+        thread.start()
 
-    # ── Upload (uno o varios) ──
+    def _ask_session_name(self):
+        """Nombre opcional para la carpeta de esta grabacion."""
+        base = os.path.basename(self._session_dir) if self._session_dir else "transcripcion"
+        text, ok = QInputDialog.getText(
+            self, "Nombre de la grabacion",
+            f"Ponele un nombre (opcional).\nSe guarda como:   {base} (tu nombre)",
+        )
+        return sanitize_folder_name(text) if ok else None
+
+    def _apply_pending_name(self):
+        """Renombra la sesion a 'transcripcion-N (nombre)' si el usuario puso uno."""
+        name, self._pending_name = self._pending_name, None
+        if not name or not self._session_dir or not os.path.isdir(self._session_dir):
+            return
+        parent = os.path.dirname(self._session_dir)
+        new_dir = os.path.join(parent, f"{os.path.basename(self._session_dir)} ({name})")
+        if os.path.exists(new_dir):
+            log.warning("Ya existe %s; no renombro", new_dir)
+            return
+        if len(new_dir) > state.MAX_SESSION_DIR_LEN:
+            log.warning("El nombre haria la ruta demasiado larga; no renombro")
+            return
+        try:
+            os.rename(self._session_dir, new_dir)
+            self._session_dir = new_dir
+            log.info("Sesion renombrada: %s", new_dir)
+        except OSError as ex:
+            log.warning("No se pudo renombrar la sesion: %s", ex)
+
+    # ── Subida de archivos ──
     def _on_upload(self):
         if self.is_recording or self.is_processing:
             return
@@ -1601,54 +1805,81 @@ class TranscriberApp(QMainWindow):
         file_paths, _ = QFileDialog.getOpenFileNames(
             self, "Seleccionar uno o varios archivos de audio", "", AUDIO_FORMATS,
         )
-        if not file_paths:
-            return
-        self._start_file_queue(file_paths)
+        if file_paths:
+            self._start_file_queue(file_paths)
 
     def _start_file_queue(self, file_paths):
-        """Encola N archivos y arranca el primero. Los siguientes se disparan en _on_process_ok."""
+        """Encola archivos y arranca el primero."""
         if self.is_recording or self.is_processing or not FFMPEG_BIN:
             return
-        # Filtrar solo audios validos
         valid = [p for p in file_paths if self._is_audio_path(p)]
         if not valid:
+            rejected = ", ".join(sorted({os.path.splitext(p)[1] or "?" for p in file_paths}))
+            self._set_status("Formato de audio no soportado", error=True)
+            QMessageBox.warning(
+                self, "Formato no soportado",
+                f"No se puede transcribir ese tipo de archivo ({rejected}).\n\n"
+                "Formatos soportados:\n" + ", ".join(AUDIO_EXTS),
+            )
             return
-        self._file_queue = valid[1:]  # los siguientes despues del primero
+        self._file_queue = valid[1:]
         self._queue_total = len(valid)
-        self._start_single_file(valid[0], queue_position=1)
+        self._start_single_file(valid[0], position=1)
 
-    def _start_single_file(self, file_path, queue_position=1):
-        self._session_dir = state.make_session_folder()
-        self._pending_name = None  # las subidas no usan nombre custom (solo grabaciones)
+    def _start_single_file(self, file_path, position=1):
+        session_dir = self._create_session_dir()
+        if not session_dir:
+            self._file_queue.clear()
+            self._queue_total = 0
+            self._finish_processing("No se pudo crear la carpeta", error=True)
+            return
+
+        self._session_dir = session_dir
+        self._pending_name = None   # las subidas no llevan nombre personalizado
         self.is_processing = True
         self.current_text = ""
         self._segments = []
         self._text_dirty = False
         self.lang_chip.hide()
+
         self.text_edit.blockSignals(True)
         self.text_edit.clear()
         self.text_edit.blockSignals(False)
-        self._set_busy(True)
+
+        self._refresh_controls()
         self._disable_action_buttons()
-        prefix = (f"({queue_position}/{self._queue_total}) "
-                  if self._queue_total > 1 else "")
+        prefix = f"({position}/{self._queue_total}) " if self._queue_total > 1 else ""
         self._set_status(f"{prefix}Procesando: {os.path.basename(file_path)}")
 
-        lang = LANGUAGES.get(self.lang_combo.currentText())
-        self._file_thread = FileTranscribeThread(
-            self.whisper, self._whisper_loaded, file_path, self._session_dir, lang,
+        thread = FileTranscribeThread(
+            self.whisper, file_path, session_dir,
+            LANGUAGES.get(self.lang_combo.currentText()),
         )
-        self._wire_thread(self._file_thread, on_done=self._on_file_thread_done)
+        self._file_thread = thread
+        self._wire_thread(thread, self._on_file_thread_done)
         self._start_busy_progress()
-        self._file_thread.start()
+        thread.start()
 
     def _process_next_in_queue(self):
         if not self._file_queue:
+            # No deberia ocurrir (solo se encola con la cola no vacia), pero salir
+            # sin cerrar el procesamiento dejaria la interfaz trabada para siempre.
             self._queue_total = 0
+            self._finish_processing("Listo", enable_actions=True)
             return
         next_path = self._file_queue.pop(0)
-        position = self._queue_total - len(self._file_queue)
-        self._start_single_file(next_path, queue_position=position)
+        self._start_single_file(next_path, position=self._queue_total - len(self._file_queue))
+
+    def _schedule_next_in_queue(self):
+        """Encadena el proximo archivo dejando respirar la interfaz.
+
+        `is_processing` se mantiene en True durante la pausa: si se bajara, habria
+        una ventana en la que el atajo global, la bandeja o un drag & drop podrian
+        arrancar otra operacion encima del lote en curso.
+        """
+        self.cancel_btn.hide()
+        self.progress_bar.hide()
+        QTimer.singleShot(QUEUE_GAP_MS, self._process_next_in_queue)
 
     def _wire_thread(self, thread, on_done):
         thread.status.connect(self._set_status)
@@ -1658,32 +1889,22 @@ class TranscriberApp(QMainWindow):
         thread.finished.connect(on_done)
 
     def _start_busy_progress(self):
-        """Cambia la barra a modo indeterminado (busy) sin texto. Se vuelve a 0-100 cuando llega progreso real."""
+        """Barra indeterminada hasta que llegue el primer progreso real."""
+        self._transcribe_started_at = None
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setTextVisible(False)
         self.progress_bar.show()
         self.cancel_btn.show()
 
-    def _disable_action_buttons(self):
-        """Pone Audio/Guardar/Copiar/Abrir en disabled (mientras procesamos)."""
-        for btn, dis in (
-            (self.open_btn, S_OPEN_DISABLED),
-            (self.copy_btn, S_COPY_DISABLED),
-            (self.play_btn, S_OPEN_DISABLED),
-            (self.save_btn, S_OPEN_DISABLED),
-        ):
-            btn.setEnabled(False)
-            btn.setStyleSheet(dis)
-
     # ── Callbacks de procesamiento ──
     def _on_progress(self, pct, partial_text):
-        # Primera vez que llega progreso real -> pasar de busy/indeterminada a 0-100%
         if self.progress_bar.maximum() == 0:
             self.progress_bar.setRange(0, 100)
             self.progress_bar.setFormat("%p%")
             self.progress_bar.setTextVisible(True)
             self._transcribe_started_at = datetime.datetime.now()
         self.progress_bar.setValue(pct)
+
         self.text_edit.blockSignals(True)
         self.text_edit.setPlainText(partial_text)
         self.text_edit.blockSignals(False)
@@ -1691,8 +1912,7 @@ class TranscriberApp(QMainWindow):
         eta = ""
         if pct > 5 and self._transcribe_started_at:
             elapsed = (datetime.datetime.now() - self._transcribe_started_at).total_seconds()
-            total_estimated = elapsed * (100 / pct)
-            remaining = max(0, int(total_estimated - elapsed))
+            remaining = max(0, int(elapsed * (100 / pct) - elapsed))
             if remaining > 60:
                 m, s = divmod(remaining, 60)
                 eta = f" (~{m}m {s:02d}s)"
@@ -1701,16 +1921,9 @@ class TranscriberApp(QMainWindow):
         self._set_status(f"Transcribiendo... {pct}%{eta}")
 
     def _on_process_ok(self, result):
-        """result es dict: {text, segments, language, language_probability, cancelled}."""
-        if self._process_thread and self._process_thread.model_loaded:
-            self._whisper_loaded = True
-        if self._file_thread and self._file_thread.model_loaded:
-            self._whisper_loaded = True
-
-        plain_text = result.get("text", "")
         self._segments = result.get("segments", [])
-        # Texto con timestamps por linea (mas util que texto plano)
-        text = format_segments_with_timestamps(self._segments) if self._segments else plain_text
+        text = (format_segments_with_timestamps(self._segments)
+                if self._segments else result.get("text", ""))
         self.current_text = text
 
         self.text_edit.blockSignals(True)
@@ -1722,17 +1935,12 @@ class TranscriberApp(QMainWindow):
         self._apply_pending_name()
         self._show_detected_language(result)
 
-        # Si quedan archivos en la cola, procesar el siguiente
         if self._file_queue:
-            log.info("Cola: %d archivos restantes", len(self._file_queue))
-            # Limpieza intermedia: hide cancel/progress momentaneamente, no enable acciones
-            self.cancel_btn.hide()
-            self.progress_bar.hide()
-            self.is_processing = False  # _start_single_file lo vuelve a poner True
-            QTimer.singleShot(150, self._process_next_in_queue)
+            log.info("Cola: quedan %d archivos", len(self._file_queue))
+            self._schedule_next_in_queue()
             return
 
-        # Cola vacia: terminado
+        self._queue_total = 0
         self._finish_processing("Listo", enable_actions=True)
         if self.tray and not self.isActiveWindow():
             self.tray.showMessage(
@@ -1741,106 +1949,75 @@ class TranscriberApp(QMainWindow):
                 QSystemTrayIcon.MessageIcon.Information, 4000,
             )
 
+    def _on_process_err(self, msg):
+        log.warning("Procesamiento: %s", msg)
+        self._cleanup_empty_session_dir()
+
+        if msg == "Cancelado" and self._file_queue:
+            # Cancelar es una decision sobre el lote entero, no sobre un archivo.
+            log.info("Cola cancelada (%d archivos descartados)", len(self._file_queue))
+            self._file_queue.clear()
+            self._queue_total = 0
+        elif self._file_queue:
+            # Un error puntual no debe tirar abajo el resto del lote.
+            self._schedule_next_in_queue()
+            return
+
+        self._queue_total = 0
+        self._finish_processing(msg, error=True)
+
+    def _finish_processing(self, status, enable_actions=False, error=False):
+        self.is_processing = False
+        self.progress_bar.hide()
+        self.cancel_btn.hide()
+        self._set_status(status, error=error)
+        self._refresh_controls()
+        if enable_actions:
+            self._enable_action_buttons()
+
+    def _on_process_thread_done(self):
+        self._process_thread = None
+
+    def _on_file_thread_done(self):
+        self._file_thread = None
+
+    def _on_cancel(self):
+        """Aborta la operacion en curso (cooperativo)."""
+        cancelled = False
+        for thread in (self._process_thread, self._file_thread, self._load_thread):
+            if thread is not None and thread.isRunning():
+                thread.cancel()
+                cancelled = True
+        if cancelled:
+            log.info("Cancelacion solicitada")
+            self._set_status("Cancelando...")
+
     def _show_detected_language(self, result):
-        """Muestra chip 'Detectado: es (98%)' si la deteccion fue automatica."""
-        chosen = self.lang_combo.currentText()
-        # Solo muestro el chip si el usuario uso Auto (sino el idioma es el que eligio)
-        if chosen != "Auto-detectar":
+        """Muestra 'Detectado: es (98%)' solo si se uso auto-deteccion."""
+        if self.lang_combo.currentText() != "Auto-detectar":
             self.lang_chip.hide()
             return
         lang = result.get("language", "")
-        prob = result.get("language_probability", 0.0)
         if not lang:
             self.lang_chip.hide()
             return
-        self.lang_chip.setText(f"Detectado: {lang} ({int(prob * 100)}%)")
+        self.lang_chip.setText(f"Detectado: {lang} ({int(result.get('language_probability', 0) * 100)}%)")
         self.lang_chip.show()
 
-    def _ask_session_name(self):
-        """Pide un nombre opcional para la grabacion al detener. Devuelve str saneado o None."""
-        base = os.path.basename(self._session_dir) if self._session_dir else "transcripcion"
-        text, ok = QInputDialog.getText(
-            self,
-            "Nombre de la grabacion",
-            f"Ponele un nombre (opcional).\nSe guardara como:   {base} (tu nombre)",
-        )
-        if not ok:
-            return None
-        return self._sanitize_name(text)
-
-    @staticmethod
-    def _sanitize_name(name):
-        """Limpia un nombre para usarlo como carpeta en Windows. None si queda vacio."""
-        if not name:
-            return None
-        cleaned = re.sub(r'[\\/:*?"<>|]', "", name)          # caracteres invalidos
-        cleaned = cleaned.strip().rstrip(". ")                # Windows no permite terminar en . o espacio
-        cleaned = cleaned[:60].strip()                        # limitar largo
-        return cleaned or None
-
-    def _apply_pending_name(self):
-        """Renombra la carpeta de sesion a 'transcripcion-N (nombre)' si el usuario puso uno."""
-        name = self._pending_name
-        self._pending_name = None
-        if not name or not self._session_dir or not os.path.isdir(self._session_dir):
-            return
-        parent = os.path.dirname(self._session_dir)
-        base = os.path.basename(self._session_dir)
-        new_dir = os.path.join(parent, f"{base} ({name})")
-        if os.path.exists(new_dir):
-            log.warning("Ya existe %s, no renombro", new_dir)
-            return
-        if len(new_dir) > MAX_SESSION_DIR_LEN:
-            log.warning("El nombre haria el path muy largo, no renombro: %s", new_dir)
-            return
-        try:
-            os.rename(self._session_dir, new_dir)
-            self._session_dir = new_dir
-            log.info("Sesion renombrada a: %s", new_dir)
-        except OSError as ex:
-            log.warning("No se pudo renombrar la sesion: %s", ex)
-
+    # ── Texto y archivos de salida ──
     def _auto_save_transcription(self):
-        """Guarda transcripcion.txt en la carpeta de sesion."""
         if not self.current_text or not self._session_dir:
             return
         try:
-            txt_path = os.path.join(self._session_dir, "transcripcion.txt")
-            with open(txt_path, "w", encoding="utf-8") as f:
+            path = os.path.join(self._session_dir, "transcripcion.txt")
+            with open(path, "w", encoding="utf-8") as f:
                 f.write(self.current_text)
-            log.info("Auto-guardado: %s", txt_path)
-        except Exception as ex:
-            log.warning("No se pudo auto-guardar txt: %s", ex)
-
-    def _show_text_context_menu(self, pos):
-        """Menu contextual del text edit: estandar (cortar/copiar/pegar) + extras."""
-        menu = self.text_edit.createStandardContextMenu()
-        menu.addSeparator()
-        srt_action = menu.addAction("Exportar como subtitulos (.srt)")
-        srt_action.setEnabled(bool(self._segments) and bool(self._session_dir))
-        srt_action.setToolTip("Genera transcripcion.srt con timestamps por linea (para subtitular video)")
-        srt_action.triggered.connect(self._export_srt)
-        menu.exec(self.text_edit.mapToGlobal(pos))
-
-    def _export_srt(self):
-        """Exporta transcripcion.srt con timestamps (manual, on-demand)."""
-        if not self._session_dir:
-            return
-        if not self._segments:
-            self._set_status("SRT no disponible (sesion cargada sin segmentos)", error=True)
-            return
-        try:
-            srt_path = os.path.join(self._session_dir, "transcripcion.srt")
-            with open(srt_path, "w", encoding="utf-8") as f:
-                f.write(build_srt(self._segments))
-            log.info("Guardado SRT: %s", srt_path)
-            self._set_status("transcripcion.srt exportado")
-        except Exception as ex:
-            log.error("Error exportando SRT: %s", ex)
-            self._set_status(f"Error: {ex}", error=True)
+            log.info("Guardado: %s", path)
+        except OSError as ex:
+            log.warning("No se pudo guardar la transcripcion: %s", ex)
+            self._set_status("No se pudo guardar el texto", error=True)
 
     def _save_edited(self):
-        """Sobreescribe transcripcion.txt con el texto editado actualmente en el TextEdit."""
         if not self._session_dir:
             return
         edited = self.text_edit.toPlainText()
@@ -1848,124 +2025,97 @@ class TranscriberApp(QMainWindow):
             path = os.path.join(self._session_dir, "transcripcion.txt")
             with open(path, "w", encoding="utf-8") as f:
                 f.write(edited)
-            self.current_text = edited
-            self._text_dirty = False
-            self._set_status("Guardado")
-            self._refresh_save_btn()
-        except Exception as ex:
+        except OSError as ex:
             log.error("Error guardando: %s", ex)
             self._set_status(f"Error guardando: {ex}", error=True)
-
-    def _on_text_changed(self):
-        """Marca el texto como 'modificado' si el usuario lo edita manualmente."""
-        # Solo activar cuando hay sesion activa (no durante setPlainText programatico)
-        if not self._session_dir or self.is_processing:
             return
-        edited = self.text_edit.toPlainText()
-        self._text_dirty = (edited != self.current_text)
+        self.current_text = edited
+        self._text_dirty = False
+        self._set_status("Guardado")
         self._refresh_save_btn()
 
-    def _refresh_save_btn(self):
-        """Habilita Guardar solo cuando el texto esta editado y hay sesion."""
-        can_save = bool(self._session_dir) and self._text_dirty and not self.is_processing
-        self.save_btn.setEnabled(can_save)
-        self.save_btn.setStyleSheet(S_OPEN if can_save else S_OPEN_DISABLED)
+    def _export_srt(self):
+        if not self._session_dir:
+            return
+        if not self._segments:
+            self._set_status("SRT no disponible (sesion cargada sin segmentos)", error=True)
+            return
+        try:
+            path = os.path.join(self._session_dir, "transcripcion.srt")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(build_srt(self._segments))
+        except OSError as ex:
+            log.error("Error exportando SRT: %s", ex)
+            self._set_status(f"Error: {ex}", error=True)
+            return
+        log.info("Guardado SRT: %s", path)
+        self._set_status("transcripcion.srt exportado")
+
+    def _show_text_context_menu(self, pos):
+        menu = self.text_edit.createStandardContextMenu()
+        menu.addSeparator()
+        action = menu.addAction("Exportar como subtitulos (.srt)")
+        action.setEnabled(bool(self._segments) and bool(self._session_dir))
+        action.triggered.connect(self._export_srt)
+        menu.exec(self.text_edit.mapToGlobal(pos))
+
+    def _on_text_changed(self):
+        if not self._session_dir or self.is_processing:
+            return
+        self._text_dirty = self.text_edit.toPlainText() != self.current_text
+        self._refresh_save_btn()
+        self._update_window_title()
+
+    def _confirm_discard_unsaved(self):
+        """True si no hay ediciones pendientes o el usuario acepta descartarlas."""
+        if not self._text_dirty:
+            return True
+        reply = QMessageBox.question(
+            self, "Cambios sin guardar",
+            "Tenes ediciones sin guardar en la transcripcion actual.\n\n"
+            "Si continuas, los cambios se pierden.\n\n"
+            "Elegi Cancelar y despues Guardar si los queres conservar.",
+            QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        return reply == QMessageBox.StandardButton.Discard
+
+    def _copy(self):
+        cursor = self.text_edit.textCursor()
+        if cursor.hasSelection():
+            # selectedText() usa U+2029 (parrafo) y U+2028 (linea) como saltos.
+            text = cursor.selectedText().replace(" ", "\n").replace(" ", "\n")
+            label = f"Copiada la seleccion ({len(text)} caracteres)"
+        else:
+            text = self.text_edit.toPlainText() or self.current_text
+            label = "Copiado al portapapeles"
+        if not text:
+            return
+        QApplication.clipboard().setText(text)
+        self._set_status(label)
 
     def _play_audio(self):
-        """Abre el audio.mp3 de la sesion actual en el reproductor por default."""
         if not self._session_dir:
             return
         mp3 = os.path.join(self._session_dir, "audio.mp3")
         if os.path.exists(mp3):
-            os.startfile(mp3)
+            open_in_explorer(mp3)
         else:
-            self._set_status("audio.mp3 no encontrado en la sesion", error=True)
+            self._set_status("No hay audio.mp3 en esta sesion", error=True)
 
-    def _on_cancel(self):
-        """Aborta la transcripcion en curso (cooperativo)."""
-        for t in (self._process_thread, self._file_thread):
-            if t is not None and t.isRunning():
-                log.info("Cancelando thread...")
-                t.cancel()
-                self._set_status("Cancelando...")
-
-    def _on_process_err(self, msg):
-        log.warning("Procesamiento: %s", msg)
-
-        # Limpieza de session folder vacio o solo con leftovers en error/cancel
-        self._cleanup_empty_session_dir()
-
-        # Si hay cola, decisiones segun tipo de error:
-        # - Cancelado por usuario: vaciar cola entera
-        # - Otro error: continuar con el proximo (no perder el batch)
-        if msg == "Cancelado" and self._file_queue:
-            n = len(self._file_queue)
-            self._file_queue.clear()
-            self._queue_total = 0
-            log.info("Cola cancelada (%d archivos descartados)", n)
-        elif self._file_queue:
-            self.cancel_btn.hide()
-            self.progress_bar.hide()
-            self.is_processing = False
-            QTimer.singleShot(150, self._process_next_in_queue)
-            return
-        self._finish_processing(msg, error=True)
-
-    def _cleanup_empty_session_dir(self):
-        """Si la sesion termino sin generar archivos utiles (audio.mp3 o transcripcion.txt),
-        eliminamos la carpeta para no dejar basura.
-        """
-        if not self._session_dir or not os.path.isdir(self._session_dir):
-            return
-        try:
-            kept = {"audio.mp3", "transcripcion.txt", "transcripcion.srt"}
-            entries = set(os.listdir(self._session_dir))
-            if not (entries & kept):
-                shutil.rmtree(self._session_dir, ignore_errors=True)
-                log.info("Eliminada carpeta de sesion vacia: %s", self._session_dir)
-                self._session_dir = None
-        except Exception as ex:
-            log.warning("No se pudo limpiar session_dir: %s", ex)
-
-    def _on_thread_done(self):
-        self._process_thread = None
-
-    def _on_file_thread_done(self):
-        self._file_thread = None
-
-    def _finish_processing(self, status, enable_actions=False, error=False):
-        self.is_processing = False
-        self.progress_bar.hide()
-        self.cancel_btn.hide()
-        self._set_status(status, error=error)
-        self._set_busy(False)
-        if enable_actions:
-            self.open_btn.setEnabled(True)
-            self.open_btn.setStyleSheet(S_OPEN)
-            self.copy_btn.setEnabled(True)
-            self.copy_btn.setStyleSheet(S_COPY)
-            mp3 = os.path.join(self._session_dir or "", "audio.mp3")
-            if os.path.exists(mp3):
-                self.play_btn.setEnabled(True)
-                self.play_btn.setStyleSheet(S_OPEN)
-            self._refresh_save_btn()
-
-    # ── Acciones del footer ──
     def _open_session(self):
-        """Abre el Explorer DIRECTAMENTE en la carpeta de la transcripcion actual.
+        """Abre la carpeta de la transcripcion actual.
 
-        Se abre la carpeta de la sesion (no se usa 'explorer /select', que falla
-        cuando el nombre tiene espacios o parentesis -ej. 'transcripcion-3 (prueba)'-
-        y termina abriendo la carpeta raiz por defecto).
+        Se abre la carpeta directamente y no `explorer /select`, que falla cuando el
+        nombre tiene espacios o parentesis (p.ej. 'transcripcion-3 (prueba)').
         """
-        target = self._session_dir if (self._session_dir and os.path.isdir(self._session_dir)) else OUTPUT_DIR
-        try:
-            os.startfile(target)
-        except Exception as ex:
-            log.warning("No se pudo abrir la carpeta %s: %s", target, ex)
+        target = (self._session_dir
+                  if self._session_dir and os.path.isdir(self._session_dir)
+                  else OUTPUT_DIR)
+        open_in_explorer(target)
 
+    # ── Historial ──
     def _open_history(self):
-        """Abre el historial de transcripciones; si el usuario carga una, la trae al editor."""
         if self.is_processing or self.is_recording:
             self._set_status("Espera a que termine la operacion actual", error=True)
             return
@@ -1978,159 +2128,209 @@ class TranscriberApp(QMainWindow):
             self._load_session(dlg.selected_dir)
 
     def _load_session(self, session_dir):
-        """Carga transcripcion.txt + transcripcion.srt de una sesion previa al editor."""
+        """Carga una transcripcion previa en el editor."""
         txt_path = os.path.join(session_dir, "transcripcion.txt")
-        if not os.path.isfile(txt_path):
-            self._set_status("La transcripcion no existe en esa sesion", error=True)
-            return
         try:
             with open(txt_path, encoding="utf-8") as f:
                 text = f.read()
-        except Exception as ex:
+        except OSError as ex:
             log.error("No se pudo leer %s: %s", txt_path, ex)
-            self._set_status(f"Error leyendo: {ex}", error=True)
+            self._set_status("No se pudo abrir esa transcripcion", error=True)
             return
 
         self._session_dir = session_dir
         self.current_text = text
-        self._segments = []  # podriamos parsear .srt si quisiera, no necesario para edit
+        # Los segmentos con timestamps no se persisten, asi que una sesion cargada
+        # no puede re-exportar el .srt (el que ya exista sigue estando).
+        self._segments = []
         self._text_dirty = False
         self.lang_chip.hide()
+
         self.text_edit.blockSignals(True)
         self.text_edit.setPlainText(text)
         self.text_edit.blockSignals(False)
 
-        # Habilitar acciones
-        self.open_btn.setEnabled(True)
-        self.open_btn.setStyleSheet(S_OPEN)
-        self.copy_btn.setEnabled(True)
-        self.copy_btn.setStyleSheet(S_COPY)
-        if os.path.exists(os.path.join(session_dir, "audio.mp3")):
-            self.play_btn.setEnabled(True)
-            self.play_btn.setStyleSheet(S_OPEN)
-        self._refresh_save_btn()
-
-        rel = os.path.relpath(session_dir, OUTPUT_DIR)
-        self._set_status(f"Cargado: {rel}")
+        self._enable_action_buttons()
+        self._set_status(f"Cargado: {os.path.relpath(session_dir, OUTPUT_DIR)}")
         log.info("Sesion cargada: %s", session_dir)
 
-    def _copy(self):
-        """Copia la seleccion del text edit, o el texto entero si no hay seleccion."""
-        cursor = self.text_edit.textCursor()
-        if cursor.hasSelection():
-            # selectedText() usa U+2029 para line breaks; lo normalizamos
-            text = cursor.selectedText().replace(" ", "\n").replace(" ", "\n")
-            label = f"Copiada seleccion ({len(text)} chars)"
+    # ── Arrastrar y soltar ──
+    @staticmethod
+    def _is_audio_path(path):
+        return bool(path) and path.lower().endswith(AUDIO_EXTS)
+
+    def dragEnterEvent(self, event):
+        accept = False
+        if not (self.is_recording or self.is_processing) and FFMPEG_BIN:
+            urls = event.mimeData().urls() if event.mimeData().hasUrls() else []
+            accept = any(u.isLocalFile() and self._is_audio_path(u.toLocalFile()) for u in urls)
+        self._set_drop_target(accept)
+        if accept:
+            event.acceptProposedAction()
         else:
-            text = self.text_edit.toPlainText() or self.current_text
-            label = "Copiado al portapapeles"
-        if not text:
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self._set_drop_target(False)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        self._set_drop_target(False)
+        dropped = [u.toLocalFile() for u in event.mimeData().urls()
+                   if u.isLocalFile() and self._is_audio_path(u.toLocalFile())]
+        if not dropped:
+            event.ignore()
             return
-        QApplication.clipboard().setText(text)
-        self._set_status(label)
+        event.acceptProposedAction()
+        self.show_from_tray()
+        if self._confirm_discard_unsaved():
+            self._start_file_queue(dropped)
+
+    def _set_drop_target(self, active):
+        self.text_edit.setProperty("droptarget", "true" if active else "false")
+        self.text_edit.style().unpolish(self.text_edit)
+        self.text_edit.style().polish(self.text_edit)
 
     # ── Cierre ──
     def closeEvent(self, event):
-        # Si hay una grabacion en curso, confirmar antes de descartarla.
-        if self.is_recording and not self._allow_quit:
-            reply = QMessageBox.question(
-                self, "Grabacion en curso",
-                "Hay una grabacion en curso.\n\n"
-                "Si cerras ahora, esa grabacion se descarta (no se transcribe).\n\n"
-                "¿Cerrar igual?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                event.ignore()
-                return
-            # Confirmo descartar: forzar cierre real (no minimizar a la bandeja).
-            self._allow_quit = True
-            self.is_recording = False
-
-        if self.tray and not self._allow_quit and not self.is_recording:
-            self.hide()
-            if not self.settings.value("tray_message_shown", False, type=bool):
-                self.tray.showMessage(
-                    "Transcriber",
-                    "Sigo corriendo en la bandeja. Click derecho > Salir para cerrar.",
-                    QSystemTrayIcon.MessageIcon.Information, 3500,
-                )
-                self.settings.setValue("tray_message_shown", True)
+        if self.is_recording and not self._confirm_discard_recording():
+            self._quit_requested = False
             event.ignore()
             return
 
-        # Desconectar callbacks que podrian dispararse despues de destruir widgets
-        if self._preload_thread is not None:
+        # Cerrar la ventana con la bandeja activa solo la esconde.
+        if self.tray is not None and not self._quit_requested:
+            self.hide()
+            if not self.settings.value(config.SETTING_TRAY_MESSAGE_SHOWN, False, type=bool):
+                self.tray.showMessage(
+                    version.APP_NAME,
+                    "Sigo corriendo en la bandeja. Click derecho > Salir para cerrar.",
+                    QSystemTrayIcon.MessageIcon.Information, 3500,
+                )
+                self.settings.setValue(config.SETTING_TRAY_MESSAGE_SHOWN, True)
+            event.ignore()
+            return
+
+        self._shutdown()
+        event.accept()
+        # QuitOnLastWindowClosed esta en False (la app vive en la bandeja), asi que
+        # sin este quit quedaria un proceso sin ventana ni icono.
+        QApplication.quit()
+
+    def _confirm_discard_recording(self):
+        """Pide confirmacion para descartar la grabacion en curso."""
+        reply = QMessageBox.question(
+            self, "Grabacion en curso",
+            "Hay una grabacion en curso.\n\n"
+            "Si cerras ahora se descarta y no se transcribe.\n\n"
+            "¿Cerrar igual?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return False
+
+        self.is_recording = False
+        self._rec_pulse.stop()
+        # discard() borra el WAV parcial: puede pesar cientos de MB.
+        self.audio.discard()
+        self._cleanup_empty_session_dir()
+        # Confirmar el descarte implica cerrar de verdad, no minimizar.
+        self._quit_requested = True
+        return True
+
+    def _shutdown(self):
+        """Detiene todo de forma ordenada. Se llama una sola vez al cerrar."""
+        self._timer.stop()
+        self._rec_pulse.stop()
+        if self._download_timer is not None:
+            self._download_timer.stop()
+
+        threads = (self._process_thread, self._file_thread, self._load_thread)
+
+        # 1) Pedir el aborto cooperativo y desconectar las senales: una senal en
+        #    vuelo que llegue a un widget ya destruido revienta con
+        #    "wrapped C/C++ object has been deleted".
+        for thread in threads:
+            if thread is None:
+                continue
             try:
-                self._preload_thread.finished.disconnect(self._on_preload_done)
+                thread.disconnect()
             except (RuntimeError, TypeError):
                 pass
+            if thread.isRunning():
+                thread.cancel()
 
-        # Matar procesos FFmpeg activos antes de esperar (no zombies)
-        for t in (self._process_thread, self._file_thread):
-            if t is not None and t.isRunning():
-                if hasattr(t, "kill_subprocesses"):
-                    t.kill_subprocesses()
-
-        for t in (self._process_thread, self._file_thread, self._preload_thread):
-            if t is not None and t.isRunning():
-                t.wait(5000)
+        # 2) Esperar. Si un hilo no responde (descarga de varios GB sin puntos de
+        #    cancelacion), se lo termina: es preferible a dejar el proceso vivo sin
+        #    ventana ni icono en la bandeja.
+        for thread in threads:
+            if thread is None or not thread.isRunning():
+                continue
+            if not thread.wait(THREAD_STOP_TIMEOUT_MS):
+                log.warning("Un hilo no termino a tiempo; se fuerza su cierre")
+                thread.terminate()
+                thread.wait(1000)
 
         self.audio.cleanup()
         self._save_settings()
+
+        if self._hotkey is not None:
+            self._hotkey.remove(QApplication.instance())
+        if self._single_server is not None:
+            self._single_server.close()
         if self.tray:
             self.tray.hide()
-        event.accept()
-        # Cierre real: asegurar que el proceso termine (QuitOnLastWindowClosed=False
-        # no lo haria solo, y quedaria un proceso fantasma sin ventana ni bandeja).
-        QApplication.quit()
+        log.info("Cierre ordenado completo")
 
 
-# ── Entry point ──
-def _splash_msg(splash, app, text):
+# ── Punto de entrada ──
+def _splash_message(splash, app, text):
     splash.showMessage(
         text,
         Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignHCenter,
-        QColor("#8b949e"),
+        QColor(C_TEXT_DIM),
     )
     app.processEvents()
 
 
-if __name__ == "__main__":
+def main():
     app = QApplication(sys.argv)
-    app.setOrganizationName(APP_ORG)
-    app.setApplicationName(APP_NAME)
-    app.setQuitOnLastWindowClosed(False)  # tray-aware: cerrar ventana no mata el proceso
+    app.setOrganizationName(version.APP_ORG)
+    app.setApplicationName(version.APP_NAME)
+    app.setApplicationVersion(version.__version__)
+    # La app vive en la bandeja: cerrar la ventana no debe matar el proceso.
+    app.setQuitOnLastWindowClosed(False)
 
     if not try_acquire_single_instance():
-        log.info("Otra instancia ya corre, saliendo")
-        sys.exit(0)
+        log.info("Ya hay otra instancia corriendo; salgo")
+        return 0
+
+    log.info("%s %s iniciando", version.APP_NAME, version.__version__)
 
     icon = make_app_icon()
     app.setWindowIcon(icon)
 
     splash = QSplashScreen(make_splash_pixmap(), Qt.WindowType.WindowStaysOnTopHint)
     splash.show()
-    _splash_msg(splash, app, "Iniciando...")
+    _splash_message(splash, app, "Iniciando...")
 
-    _splash_msg(splash, app, "Organizando archivos...")
+    _splash_message(splash, app, "Organizando archivos...")
     try:
         state.migrate_old_layout()
-    except Exception as ex:
-        log.warning("Migracion fallo (no critica): %s", ex, exc_info=True)
+    except OSError as ex:
+        log.warning("La migracion fallo (no es critico): %s", ex, exc_info=True)
 
-    _splash_msg(splash, app, "Verificando modelos...")
-    try:
-        state.dedupe_models_at_startup(WHISPER_MODEL)
-    except Exception as ex:
-        log.warning("Dedupe fallo (no critico): %s", ex, exc_info=True)
-
-    _splash_msg(splash, app, "Cargando interfaz...")
+    _splash_message(splash, app, "Cargando interfaz...")
     window = TranscriberApp(app_icon=icon)
-    window._single_server = SingleInstanceServer(window)
+    window.attach_single_instance_server(SingleInstanceServer(window))
+    window.install_hotkey(app)
 
-    _splash_msg(splash, app, "Listo. Whisper se carga en segundo plano.")
+    _splash_message(splash, app, "Listo. El modelo se carga en segundo plano.")
     window.show()
     splash.finish(window)
-    sys.exit(app.exec())
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

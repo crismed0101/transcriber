@@ -1,18 +1,21 @@
-"""Utilidades compartidas (sin dependencias externas al proyecto)."""
+"""Utilidades compartidas. Sin dependencias fuera de la biblioteca estandar."""
 import os
+import re
 import sys
 import subprocess
 
+# Evita que subprocess abra ventanas de consola cuando la app corre sin consola.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
-# Flag para que subprocess no abra ventanas de consola en Windows + pythonw.exe
-NO_WINDOW = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+# Caracteres que Windows no admite en nombres de archivo o carpeta.
+_INVALID_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|]')
 
 
 def resource_path(rel):
-    """Resuelve un recurso relativo, soportando PyInstaller (sys._MEIPASS).
+    """Resuelve un recurso relativo, contemplando PyInstaller.
 
-    En frozen mode busca primero en _MEIPASS (datas embebidas), luego junto al .exe.
-    En dev busca relativo a este archivo.
+    En modo congelado busca primero en sys._MEIPASS (los datos embebidos) y despues
+    junto al ejecutable. En desarrollo, relativo a este archivo.
     """
     bases = []
     if hasattr(sys, "_MEIPASS"):
@@ -20,14 +23,28 @@ def resource_path(rel):
     if getattr(sys, "frozen", False):
         bases.append(os.path.dirname(os.path.abspath(sys.executable)))
     bases.append(os.path.dirname(os.path.abspath(__file__)))
+
     for base in bases:
         candidate = os.path.join(base, rel)
         if os.path.exists(candidate):
             return candidate
-    # No existe en ningun lado: devolver el path canonico igual (caller decide)
+    # No esta en ningun lado: devolvemos la ruta canonica y decide quien llama.
     return os.path.join(bases[0], rel)
 
 
 def same_path(a, b):
-    """Comparacion case-insensitive y normalizada de paths (correcto en Windows)."""
+    """Compara rutas normalizadas y sin distinguir mayusculas (correcto en Windows)."""
     return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+
+
+def sanitize_folder_name(name, max_len=60):
+    """Convierte texto libre en un nombre de carpeta valido en Windows.
+
+    Devuelve None si no queda nada utilizable.
+    """
+    if not name:
+        return None
+    cleaned = _INVALID_FILENAME_CHARS.sub("", name)
+    # Windows no admite nombres terminados en punto ni en espacio.
+    cleaned = cleaned.strip().rstrip(". ")
+    return cleaned[:max_len].strip() or None

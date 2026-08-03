@@ -1,59 +1,23 @@
-import os
+"""Configuracion de la app: rutas de salida, idiomas, formatos y FFmpeg.
+
+Lo que NO vive aca a proposito:
+  - La eleccion de modelo / device / precision -> hardware.py (depende del equipo
+    y se resuelve de forma perezosa, no al importar).
+  - La identidad y version de la app -> version.py.
+"""
 import shutil
-import logging
 
 import paths
-import hardware
 
-log = logging.getLogger(__name__)
-
-# ── Datos del usuario (siempre Documents/Transcriber, ver paths.data_dir) ──
+# ── Datos del usuario (Documentos/Transcriber, ver paths.data_dir) ──
 OUTPUT_DIR = paths.data_dir()
-
-
-# ── Whisper: device (GPU si hay CUDA, sino CPU) ──
-def _detect_device():
-    try:
-        import ctranslate2
-        if ctranslate2.get_cuda_device_count() > 0:
-            return "cuda", "float16"
-    except Exception:
-        pass
-    log.warning("CUDA no disponible, usando CPU (sera mas lento)")
-    return "cpu", "int8"
-
-
-WHISPER_DEVICE, WHISPER_COMPUTE_TYPE = _detect_device()
-
-
-# ── Whisper: modelo auto-seleccionado segun el hardware de ESTA PC ──
-# La app elige el mejor modelo que entra en la GPU/CPU detectada (ver hardware.recommend_model):
-#   GPU grande -> large-v3 ; GPU mediana/chica -> medium/small/base ; sin GPU -> small/base/tiny.
-# Asi funciona bien en cualquier PC sin quedarse sin memoria. Se puede forzar uno fijo
-# con la variable de entorno TRANSCRIBER_MODEL (util para testing/debug).
-# Reusa el device ya detectado para no consultar CUDA dos veces al arranque.
-def _select_model():
-    override = os.environ.get("TRANSCRIBER_MODEL")
-    if override:
-        log.info("Modelo forzado via TRANSCRIBER_MODEL=%s", override)
-        return override
-    try:
-        m = hardware.recommend_model(cuda=(WHISPER_DEVICE == "cuda"))
-        log.info("Modelo auto-seleccionado segun hardware: %s", m)
-        return m
-    except Exception:
-        log.warning("No se pudo auto-seleccionar modelo; uso large-v3 por defecto", exc_info=True)
-        return "large-v3"
-
-
-WHISPER_MODEL = _select_model()
 
 # ── FFmpeg: bundled (al lado del .exe) > sistema (PATH) ──
 FFMPEG_BIN = paths.ffmpeg_path() or shutil.which("ffmpeg")
 
 # ── Idiomas ──
-# Español primero -> es el default visual + el mas usado.
-# Auto-detectar disponible pero NO default (se confunde es/pt en audios cortos).
+# Espanol primero: es el default visual y el mas usado.
+# Auto-detectar esta disponible pero no es default (confunde es/pt en audios cortos).
 LANGUAGES = {
     "Español": "es",
     "Auto-detectar": None,
@@ -65,4 +29,22 @@ LANGUAGES = {
 }
 
 # ── Formatos de audio soportados ──
-AUDIO_FORMATS = "Archivos de audio (*.mp3 *.wav *.m4a *.ogg *.flac *.wma *.aac *.opus *.webm);;Todos (*)"
+# Unica fuente de verdad: el filtro del dialogo y la validacion de drag & drop
+# se derivan de esta tupla, para que no puedan divergir.
+AUDIO_EXTS = (".mp3", ".wav", ".m4a", ".ogg", ".flac", ".wma", ".aac", ".opus", ".webm")
+AUDIO_FORMATS = (
+    "Archivos de audio ("
+    + " ".join(f"*{e}" for e in AUDIO_EXTS)
+    + ");;Todos (*)"
+)
+
+# ── Etiqueta del modo automatico en el selector de modelo ──
+MODEL_AUTO = "Automatico"
+
+# ── Claves de QSettings (centralizadas para que no se escriban a mano) ──
+SETTING_LANGUAGE = "language"
+SETTING_SOURCE = "source"
+SETTING_MODEL = "model"
+SETTING_GEOMETRY = "geometry"
+SETTING_TRAY_MESSAGE_SHOWN = "tray_message_shown"
+SETTING_CPU_WARNING_SHOWN = "cpu_warning_shown"

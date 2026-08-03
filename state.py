@@ -1,7 +1,7 @@
-"""Lifecycle y estado: migraciones de layout, dedupe de modelos, creacion de sesiones.
+"""Ciclo de vida en disco: migraciones de layout, limpieza de modelos y sesiones.
 
-Este modulo no tiene side effects al importar (a diferencia de paths.py que setea HF_HOME).
-Las funciones aca se llaman explicitamente desde main.py durante el arranque.
+Este modulo no tiene efectos al importarse (a diferencia de paths.py, que fija
+HF_HOME). Las funciones se llaman explicitamente desde el arranque.
 """
 import os
 import re
@@ -15,75 +15,107 @@ from utils import same_path
 log = logging.getLogger(__name__)
 
 _OLD_SESSION_RE = re.compile(r"^(archivo|grabacion)_(\d{4})(\d{2})(\d{2})_\d{6}$")
-# Acepta 'transcripcion-N' y 'transcripcion-N (nombre custom)' (grupo 1 = el numero).
+# Acepta 'transcripcion-N' y 'transcripcion-N (nombre custom)'; grupo 1 = numero.
 _TRANSCRIPCION_RE = re.compile(r"^transcripcion-(\d+)( \(.+\))?$")
 
+# Nombres que deja la app dentro de una sesion y que valen la pena conservar.
+SESSION_KEEP_FILES = frozenset({"audio.mp3", "transcripcion.txt", "transcripcion.srt"})
 
-# ── Pre-migracion: log/settings ANTES de abrir el FileHandler ──
+# Margen sobre el MAX_PATH de Windows (260) para que entren los nombres de archivo
+# que la app agrega dentro de la sesion (audio.mp3, transcripcion.srt, ...).
+MAX_SESSION_DIR_LEN = 240
+
+
+# ── Pre-migracion: log y settings ANTES de abrir el FileHandler ──
 def pre_migrate_log_settings():
     """Mueve log/settings de layouts viejos al system_dir actual.
 
-    Layouts viejos posibles:
-      <data>/transcriber.log              (raiz, layout original)
-      <data>/settings.ini                 (raiz)
-      <data>/_sistema/transcriber.log     (layout intermedio)
-      <data>/_sistema/settings.ini        (layout intermedio)
-
-    Corre ANTES de abrir el FileHandler (Windows no permite mover archivos en uso).
-    Silencioso porque el logger aun no esta inicializado.
+    Corre antes de abrir el FileHandler porque Windows no permite mover un archivo
+    en uso. Silencioso a proposito: el logger todavia no existe.
     """
     sysd = paths.system_dir()
-    data = paths.data_dir()
-    intermediate_sysd = os.path.join(data, "_sistema")
+    roots = [paths.data_dir()]
+    legacy_docs = paths.legacy_documents_dir()
+    if legacy_docs:
+        roots.append(os.path.join(legacy_docs, paths.APP_DIRNAME))
 
     candidates = []
-    for fname in ("transcriber.log", "settings.ini"):
-        candidates.append((os.path.join(data, fname), os.path.join(sysd, fname)))
-        candidates.append((os.path.join(intermediate_sysd, fname), os.path.join(sysd, fname)))
+    for root in roots:
+        for fname in ("transcriber.log", "settings.ini"):
+            candidates.append((os.path.join(root, fname), os.path.join(sysd, fname)))
+            candidates.append((os.path.join(root, "_sistema", fname),
+                               os.path.join(sysd, fname)))
 
     for old, new in candidates:
-        if not os.path.isfile(old):
-            continue
-        if same_path(old, new):
+        if not os.path.isfile(old) or same_path(old, new):
             continue
         try:
             if os.path.exists(new):
                 os.remove(old)
             else:
                 shutil.move(old, new)
-        except Exception:
+        except OSError:
             pass
 
 
-# ── Sesion del dia ──
-def make_session_folder():
-    """Crea (o reusa) <data>/<YYYY-MM-DD>/transcripcion-<N>/ y la devuelve.
-
-    N se calcula contando carpetas 'transcripcion-*' del dia + 1.
-    """
-    data = paths.data_dir()
-    date_str = datetime.date.today().strftime("%Y-%m-%d")
-    day_dir = os.path.join(data, date_str)
-    os.makedirs(day_dir, exist_ok=True)
-
+# ── Sesiones ──
+def next_session_number(day_dir):
+    """Proximo N libre para 'transcripcion-N' dentro de una carpeta de fecha."""
     n = 1
-    for entry in os.listdir(day_dir):
+    try:
+        entries = os.listdir(day_dir)
+    except OSError:
+        return n
+    for entry in entries:
         m = _TRANSCRIPCION_RE.match(entry)
         if m and os.path.isdir(os.path.join(day_dir, entry)):
             n = max(n, int(m.group(1)) + 1)
+    return n
 
-    session = os.path.join(day_dir, f"transcripcion-{n}")
+
+def make_session_folder():
+    """Crea y devuelve <data>/<YYYY-MM-DD>/transcripcion-<N>/.
+
+    Raises:
+        OSError: si no se puede crear (disco lleno, carpeta de solo lectura,
+            OneDrive sin conexion) o si la ruta supera el limite de Windows. El
+            caller debe manejarlo: es un slot de Qt y una excepcion sin capturar
+            aborta el proceso.
+    """
+    day_dir = os.path.join(paths.data_dir(), datetime.date.today().strftime("%Y-%m-%d"))
+    os.makedirs(day_dir, exist_ok=True)
+    session = os.path.join(day_dir, f"transcripcion-{next_session_number(day_dir)}")
+
+    if len(session) > MAX_SESSION_DIR_LEN:
+        raise OSError(
+            f"La ruta de la transcripcion es demasiado larga ({len(session)} "
+            f"caracteres, maximo {MAX_SESSION_DIR_LEN}):\n{session}\n\n"
+            "Mové tu carpeta Documentos a una ruta mas corta."
+        )
+
     os.makedirs(session, exist_ok=True)
     return session
 
 
+def session_has_content(session_dir):
+    """True si la sesion tiene algun archivo que valga la pena conservar."""
+    try:
+        return bool(set(os.listdir(session_dir)) & SESSION_KEEP_FILES)
+    except OSError:
+        return False
+
+
 # ── Migracion de layouts viejos ──
 def _merge_dir(src_root, dst_root, kind="entrada"):
-    """Mueve subentries de src_root a dst_root sin pisar; borra src_root si queda vacio."""
+    """Mueve el contenido de src_root a dst_root sin pisar; borra src si queda vacio."""
     if not os.path.isdir(src_root) or same_path(src_root, dst_root):
         return
     os.makedirs(dst_root, exist_ok=True)
-    for entry in os.listdir(src_root):
+    try:
+        entries = os.listdir(src_root)
+    except OSError:
+        return
+    for entry in entries:
         src = os.path.join(src_root, entry)
         dst = os.path.join(dst_root, entry)
         if os.path.exists(dst):
@@ -91,7 +123,7 @@ def _merge_dir(src_root, dst_root, kind="entrada"):
         try:
             shutil.move(src, dst)
             log.info("Migrada %s: %s -> %s", kind, src, dst)
-        except Exception as ex:
+        except OSError as ex:
             log.warning("No se pudo migrar %s %s: %s", kind, entry, ex)
     try:
         if not os.listdir(src_root):
@@ -101,117 +133,75 @@ def _merge_dir(src_root, dst_root, kind="entrada"):
 
 
 def migrate_old_layout():
-    """Migra layouts viejos al actual.
+    """Lleva instalaciones viejas al layout actual. Idempotente y no destructiva.
 
-    A) <data>/archivo_*/, <data>/grabacion_*/         -> <data>/<date>/transcripcion-N/
-    B) <data>/models/                                 -> <system>/models/  (layout original)
-    C) <data>/_sistema/models/                        -> <system>/models/  (layout intermedio)
-    D) <data>/_sistema/                               -> eliminar si queda vacio
-
-    Idempotente y seguro: solo mueve si el destino no existe.
+    Migraciones cubiertas:
+      A) <Documents-sin-redirigir>/Transcriber/  -> <Documentos-real>/Transcriber/
+         (la app armaba la ruta a mano y con OneDrive escribia en la carpeta
+          huerfana; ver paths.documents_dir)
+      B) <data>/models/ y <data>/_sistema/models/ -> <system>/models/
+      C) <data>/archivo_*/ y <data>/grabacion_*/  -> <data>/<fecha>/transcripcion-N/
     """
     data = paths.data_dir()
+
+    # A) Documents no redirigido -> Documentos real
+    legacy_docs = paths.legacy_documents_dir()
+    if legacy_docs:
+        _merge_dir(os.path.join(legacy_docs, paths.APP_DIRNAME), data, kind="carpeta")
+
+    # B) Modelos que quedaron entre los datos del usuario
     new_models = paths.models_dir()
-    intermediate_sysd = os.path.join(data, "_sistema")
-
-    # B) <data>/models/
+    intermediate = os.path.join(data, "_sistema")
     _merge_dir(os.path.join(data, "models"), new_models, kind="modelo")
+    _merge_dir(os.path.join(intermediate, "models"), new_models, kind="modelo")
+    try:
+        if os.path.isdir(intermediate) and not os.listdir(intermediate):
+            os.rmdir(intermediate)
+    except OSError:
+        pass
 
-    # C) <data>/_sistema/models/
-    _merge_dir(os.path.join(intermediate_sysd, "models"), new_models, kind="modelo")
-
-    # D) Eliminar _sistema/ si quedo vacio
-    if os.path.isdir(intermediate_sysd):
-        try:
-            if not os.listdir(intermediate_sysd):
-                os.rmdir(intermediate_sysd)
-                log.info("Eliminado %s (vacio)", intermediate_sysd)
-        except OSError:
-            pass
-
-    # A) Sesiones viejas
-    for entry in list(os.listdir(data)):
+    # C) Sesiones con el nombre viejo
+    try:
+        entries = list(os.listdir(data))
+    except OSError:
+        return
+    for entry in entries:
         m = _OLD_SESSION_RE.match(entry)
         if not m:
             continue
         full = os.path.join(data, entry)
         if not os.path.isdir(full):
             continue
-        date_str = f"{m.group(2)}-{m.group(3)}-{m.group(4)}"
-        day_dir = os.path.join(data, date_str)
-        os.makedirs(day_dir, exist_ok=True)
-        n = 1
-        for d in os.listdir(day_dir):
-            mm = _TRANSCRIPCION_RE.match(d)
-            if mm:
-                n = max(n, int(mm.group(1)) + 1)
-        target = os.path.join(day_dir, f"transcripcion-{n}")
+        day_dir = os.path.join(data, f"{m.group(2)}-{m.group(3)}-{m.group(4)}")
         try:
+            os.makedirs(day_dir, exist_ok=True)
+            target = os.path.join(day_dir, f"transcripcion-{next_session_number(day_dir)}")
             shutil.move(full, target)
             log.info("Migrada sesion: %s -> %s", full, target)
-        except Exception as ex:
-            log.warning("No se pudo migrar sesion %s: %s", entry, ex)
+        except OSError as ex:
+            log.warning("No se pudo migrar la sesion %s: %s", entry, ex)
 
 
-# ── Dedupe de modelos Whisper ──
-def dedupe_models_at_startup(model_name):
-    """Mantiene una sola copia del modelo activo en paths.models_dir().
+# ── Limpieza del cache de modelos ──
+def cleanup_model_cache(active_model):
+    """Deja un solo modelo Whisper en el cache PROPIO de la app.
 
-    - Borra duplicados del modelo activo en caches HF estandar (~/.cache/huggingface/hub).
-    - Si el modelo activo solo existe en un cache externo, lo MUEVE a la carpeta portable.
-    - Borra otros modelos Whisper que esten en la carpeta portable (no el activo).
-    No toca otros modelos en caches externos (podrian usarlos otras apps).
+    Solo toca `paths.models_dir()`. Deliberadamente NO toca los caches compartidos
+    de HuggingFace (~/.cache/huggingface, %LOCALAPPDATA%\\huggingface): son de todo
+    el sistema y borrar ahi le rompe el cache a cualquier otro proyecto del usuario
+    que use el mismo modelo.
     """
-    target_name = f"models--Systran--faster-whisper-{model_name}"
-    portable_root = paths.models_dir()
-    portable_target = os.path.join(portable_root, target_name)
-
-    appdata = os.environ.get("LOCALAPPDATA") or ""
-    raw_caches = [
-        os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub"),
-        os.path.join(appdata, "huggingface", "hub"),
-        # Dev-mode cache de Transcriber (cuando se corre desde fuente)
-        os.path.join(appdata, "Transcriber", "models"),
-    ]
-    seen = set()
-    external_caches = []
-    for c in raw_caches:
-        if not c or not os.path.isdir(c):
+    root = paths.models_dir()
+    keep = os.path.basename(paths.model_cache_dir(active_model))
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return
+    for entry in entries:
+        full = os.path.join(root, entry)
+        if entry == keep or not os.path.isdir(full):
             continue
-        if same_path(c, portable_root):
+        if not entry.startswith("models--") or "whisper" not in entry.lower():
             continue
-        key = os.path.normcase(os.path.normpath(c))
-        if key in seen:
-            continue
-        seen.add(key)
-        external_caches.append(c)
-
-    portable_has_target = os.path.isdir(portable_target)
-
-    for cache in external_caches:
-        ext_path = os.path.join(cache, target_name)
-        if not os.path.isdir(ext_path):
-            continue
-        if portable_has_target:
-            log.info("Dedupe: borrando duplicado externo %s", ext_path)
-            shutil.rmtree(ext_path, ignore_errors=True)
-        else:
-            log.info("Dedupe: moviendo %s -> %s", ext_path, portable_target)
-            try:
-                shutil.move(ext_path, portable_target)
-                portable_has_target = True
-            except Exception as ex:
-                log.warning("No se pudo mover modelo: %s", ex)
-
-    # Limpiar otros modelos whisper en la carpeta portable (mantener solo el activo)
-    if os.path.isdir(portable_root):
-        for entry in os.listdir(portable_root):
-            full = os.path.join(portable_root, entry)
-            if not os.path.isdir(full):
-                continue
-            if not entry.startswith("models--") or "whisper" not in entry.lower():
-                continue
-            if entry == target_name:
-                continue
-            log.info("Dedupe: borrando modelo extra del portable %s", full)
-            shutil.rmtree(full, ignore_errors=True)
+        log.info("Borrando modelo que ya no se usa: %s", full)
+        shutil.rmtree(full, ignore_errors=True)

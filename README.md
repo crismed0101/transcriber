@@ -1,37 +1,72 @@
 # Transcriber
 
-App de escritorio Windows para transcribir audio a texto con Whisper (offline, local).
+App de escritorio Windows para transcribir audio a texto con Whisper, sin conexión.
 
-- Graba el audio del sistema (loopback WASAPI) o un microfono.
-- Empaquetada como **portable** (copias la carpeta y funciona en cualquier Windows).
-- Detecta tu hardware (GPU/CPU + RAM); el modelo Whisper esta fijo en `large-v3`.
-- FFmpeg bundled, sin dependencias externas en la version distribuida.
+- Graba el audio del sistema (loopback WASAPI) o un micrófono.
+- Se adapta sola al equipo: elige el modelo que entra en la GPU o la CPU disponible
+  y, si la configuración elegida no carga, degrada al siguiente escalón sin
+  intervención del usuario.
+- FFmpeg incluido, sin dependencias externas en la versión distribuida.
 
-## Para usuarios finales
+## Instalación
 
-Bajate la carpeta `Transcriber/` (zipeada). Doble click en `Transcriber.exe`.
+Un solo comando en PowerShell, en cualquier Windows 10/11 de 64 bits:
 
-Documentacion de uso: `USER_README.txt` (incluido en el zip).
+```powershell
+irm https://raw.githubusercontent.com/crismed0101/transcriber/main/install.ps1 | iex
+```
+
+Descarga la última versión publicada, verifica su SHA256 y la instala por usuario, sin
+pedir permisos de administrador.
+
+Para instalar sin asistente (varias PC) o una versión concreta:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/crismed0101/transcriber/main/install.ps1))) -Silent
+& ([scriptblock]::Create((irm .../install.ps1))) -Version v1.1.0
+```
+
+> Requiere que el repositorio y sus releases sean **públicos**. Si es privado, hay que
+> exportar un token antes: `$env:GITHUB_TOKEN = "ghp_..."`.
+
+Alternativa manual: descargar `Transcriber-Setup-vX.Y.Z-windows-x64.exe` desde
+[Releases](https://github.com/crismed0101/transcriber/releases) y ejecutarlo.
+
+Guía de uso: `USER_README.txt` (se instala junto a la app como `LEEME.txt`).
+
+### Publicar una versión
+
+```cmd
+venv\Scripts\python build.py --clean --installer --strict --lock
+dist\Transcriber\Transcriber.exe --selftest
+gh release create v1.1.0 installer\*.exe installer\*.sha256 ^
+   --notes-file .github\release-notes-v1.1.0.md
+```
+
+El `.sha256` es lo que `install.ps1` verifica antes de ejecutar el instalador: como el
+binario no está firmado, es la única garantía de integridad que se puede ofrecer.
 
 ## Para desarrolladores
 
 ### Componentes
 
-| Archivo | Proposito |
+| Archivo | Propósito |
 |---|---|
-| `main.py` | Entry point (UI con PyQt6, threads de procesamiento). |
-| `paths.py` | Dual-mode portable/estandar (HF_HOME side effect). |
-| `state.py` | Migraciones de layout, dedupe de modelos, sesiones. |
-| `utils.py` | Helpers (NO_WINDOW, resource_path, same_path). |
-| `config.py` | Modelo Whisper, idiomas, FFmpeg path, OUTPUT_DIR. |
-| `hardware.py` | Deteccion VRAM/RAM/CUDA. |
-| `audio_capture.py` | Grabacion loopback WASAPI + microfono (pyaudiowpatch). |
-| `transcriber.py` | Wrapper de faster-whisper, build_srt. |
-| `build.py` | Helper: descarga FFmpeg + corre PyInstaller. |
-| `Transcriber.spec` | Spec PyInstaller (onedir, sin UPX). |
-| `start.bat` | Script de arranque dev (crea venv, instala deps, lanza). |
-| `requirements.txt` | Dependencias Python. |
-| `USER_README.txt` | Guia para el usuario final (se copia al .exe distribuible). |
+| `main.py` | Entry point: interfaz PyQt6, hilos de trabajo, ciclo de vida. |
+| `version.py` | Única fuente de verdad de versión e identidad de la app. |
+| `paths.py` | Rutas vía Known Folders de Windows (efecto de borde: fija `HF_HOME`). |
+| `hardware.py` | Detección del equipo y elección del motor. Toda la lógica adaptativa vive acá. |
+| `transcriber.py` | Motor Whisper con degradación automática. |
+| `subtitles.py` | Formato de marcas de tiempo y SRT. Puro, sin dependencias. |
+| `audio_capture.py` | Grabación loopback WASAPI y micrófono (pyaudiowpatch). |
+| `state.py` | Migraciones de layout, numeración de sesiones, limpieza de modelos. |
+| `config.py` | Idiomas, formatos de audio, FFmpeg, claves de ajustes. |
+| `utils.py` | Helpers sin dependencias externas. |
+| `selftest.py` | Autodiagnóstico del binario congelado (`--selftest`). |
+| `build.py` | Empaquetado: FFmpeg + PyInstaller + Inno Setup. |
+| `Transcriber.spec` | Spec de PyInstaller (onedir, sin UPX, con recurso de versión). |
+| `Transcriber.iss` | Instalador Inno Setup, por usuario y sin UAC. |
+| `tests/` | Pruebas de las funciones puras (no requieren el stack completo). |
 
 ### Setup local (Windows)
 
@@ -41,45 +76,93 @@ venv\Scripts\pip install -r requirements.txt
 venv\Scripts\pythonw main.py
 ```
 
-Necesitas FFmpeg en el PATH (`winget install Gyan.FFmpeg`) si no haces el build portable.
+Necesitás FFmpeg en el PATH (`winget install Gyan.FFmpeg`) si no hacés el build.
+`start.bat` automatiza todos esos pasos.
 
-O directamente con `start.bat` que automatiza esos pasos.
-
-### Empaquetar (portable)
+### Pruebas
 
 ```cmd
-venv\Scripts\python build.py
+venv\Scripts\python -m unittest discover -s tests -t .
 ```
 
-Salida: `dist/Transcriber/` con todo lo necesario (incluido `bin/ffmpeg.exe` + `portable.txt`). Zipeala y compartila.
+No requieren PyQt6 ni faster-whisper: cubren las funciones puras (formato SRT,
+saneado de nombres, escalera de modelos, numeración de sesiones, limpieza de cache).
 
-### Configuracion
+### Empaquetar
 
-La configuracion va en `config.py`. La app guarda settings de usuario (idioma, fuente, geometria) en `settings.ini` dentro del directorio del modo activo:
-- Portable: `<app>/_sistema/settings.ini`
-- Estandar: `%LOCALAPPDATA%\Transcriber\settings.ini`
+El build **debe correr en Windows**: PyInstaller no hace cross-compilation y
+`pyaudiowpatch` es Windows-only. Si desarrollás desde WSL, copiá el árbol a una ruta
+nativa (`C:\dev\transcriber`) antes de compilar; no compiles sobre `\\wsl$\`.
 
-**No commitear secretos** — usar variables de entorno; los runtime files estan en `.gitignore`.
+```cmd
+winget install Python.Python.3.12
+winget install JRSoftware.InnoSetup
 
-### Notas tecnicas
+python -m venv venv
+venv\Scripts\pip install -r requirements.txt
+venv\Scripts\python build.py --clean --installer --strict
+```
 
-- **PyInstaller onedir** (no onefile): arranque rapido, una sola carpeta distribuible.
-- **HF_HOME** se setea a la carpeta de modelos antes de importar `faster_whisper`, manteniendo el cache portable.
-- **AppUserModelID** seteado via `ctypes` para que la barra de tareas Windows muestre la identidad propia (no se agrupa bajo Python).
-- **Single-instance**: lock per-user via `QLocalServer` (evita doble launch).
-- **System tray**: cerrar la ventana minimiza; salida real desde el menu del icono de bandeja.
-- **Modo dual portable/estandar**: detectado por la presencia de `portable.txt` junto al `.exe`.
-- **Layout de sesiones**: `<date>/transcripcion-N/audio.mp3 + transcripcion.txt + transcripcion.srt`.
-- **Auto-dedupe** de modelos cross-cache (HF default + LOCALAPPDATA + portable).
-- **Race condition** del modelo: `Transcriber.load_model()` usa un Lock.
+Salida: `installer\Transcriber-Setup-vX.Y.Z-windows-x64.exe`.
 
-### Reportar bugs / solicitar features
+`--strict` convierte en error cualquier degradación silenciosa del build (no se pudo
+limpiar, no se pudo promover, falta un artefacto necesario). Usalo siempre que el
+resultado se vaya a distribuir.
 
-Ver `SECURITY.md` para reportes de vulnerabilidades. Para bugs y features usar el issue tracker del repo.
+Antes de publicar, verificá el binario congelado:
+
+```cmd
+dist\Transcriber\Transcriber.exe --selftest
+```
+
+Comprueba lo que un build verde igual puede tener roto: `onnxruntime` y los assets
+del VAD, las DLL de FFmpeg de PyAV, y la presencia de FFmpeg. Devuelve 0 si todo
+está bien y deja el detalle en `%LOCALAPPDATA%\Transcriber\selftest.log`.
+
+Para congelar el entorno del build: `python build.py --lock` genera
+`requirements.lock.txt`.
+
+### Configuración
+
+Los ajustes del usuario (idioma, fuente, modelo, geometría) van a
+`%LOCALAPPDATA%\Transcriber\settings.ini`. Las claves están centralizadas en
+`config.py`.
+
+`TRANSCRIBER_MODEL` fuerza un modelo concreto y salta la selección automática (útil
+para depurar).
+
+### Notas técnicas
+
+- **PyInstaller onedir** (no onefile): arranca rápido y evita el extractor
+  automático, que dispara falsos positivos de antivirus.
+- **Rutas por Known Folder**: `SHGetKnownFolderPath(FOLDERID_Documents)` en vez de
+  `%USERPROFILE%\Documents`. Con OneDrive Backup activo, la segunda apunta a una
+  carpeta huérfana y el usuario no encuentra sus transcripciones.
+- **`HF_HOME`** se fija antes de importar `faster_whisper`, para que los modelos
+  queden bajo el control de la app.
+- **Selección de motor**: `hardware.engine_candidates()` arma la escalera
+  GPU → GPU más chica → CPU y `Transcriber.load_model()` la recorre hasta que una
+  configuración carga de verdad. `get_cuda_device_count() > 0` solo consulta el
+  driver, así que no alcanza como detección.
+- **CUDA**: las DLL van dentro de la carpeta de `ctranslate2` (`destdir` en el spec)
+  porque CTranslate2 solo hace `os.add_dll_directory()` sobre su propio directorio.
+- **INT8 en GPU**: no usar. CTranslate2 4.6.2 lo deshabilitó en Blackwell (sm_120).
+- **`AppUserModelID`** vía `ctypes` para que la barra de tareas muestre identidad
+  propia y no agrupe bajo Python.
+- **Instancia única** con `QLocalServer`, por usuario (sesiones de Escritorio Remoto).
+- **Atajo global** con `RegisterHotKey` y un filtro de eventos nativo; `QShortcut`
+  solo funciona con la ventana enfocada.
+- **Bandeja**: cerrar la ventana minimiza; se sale de verdad desde el menú del icono.
 
 ### Limitaciones conocidas
 
-- Solo Windows (`pyaudiowpatch` para grabacion loopback es Windows-only).
-- Sin firma de codigo: SmartScreen advierte la primera vez.
-- Sin auto-update.
-- Modelo se descarga de HuggingFace en la primera ejecucion (~3 GB para `large-v3`).
+- Solo Windows: `pyaudiowpatch` (loopback WASAPI) es Windows-only.
+- Sin firma de código: SmartScreen advierte la primera vez.
+- Sin actualización automática.
+- El modelo se descarga de HuggingFace en la primera ejecución.
+
+### Reportar problemas
+
+Ver `SECURITY.md` para vulnerabilidades. Para bugs y features, el issue tracker del
+repositorio. Adjuntá `%LOCALAPPDATA%\Transcriber\transcriber.log` y la salida de
+`Transcriber.exe --selftest`.

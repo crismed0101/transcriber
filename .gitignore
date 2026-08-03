@@ -10,12 +10,13 @@ venv/
 .venv/
 env/
 
-# PyInstaller (output del build)
+# Salida del empaquetado
 build/
 dist/
 dist_*/
+installer/
 
-# FFmpeg bundled (lo descarga build.py al empaquetar; no committearlo)
+# FFmpeg incluido (lo descarga build.py; no se commitea, pesa ~100 MB)
 bin/
 
 # Runtime / generado en ejecucion
@@ -30,12 +31,8 @@ settings.ini
 # Build local de Windows (artefacto, no fuente)
 Transcriber.exe
 
-# Instalador (pesa ~1.5 GB; va como Release de GitHub, NO dentro del repo)
-installer/
-Transcriber-Setup.exe
-
-# Metadatos de Windows (alternate data streams visibles desde WSL)
-*:Zone.Identifier
+# NOTA: requirements.lock.txt SI se commitea. Es lo que permite reproducir
+# exactamente el entorno con el que se compilo un release.
 
 # IDE / herramientas
 .claude/

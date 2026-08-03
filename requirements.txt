@@ -1,8 +1,60 @@
-PyQt6>=6.7
-pyaudiowpatch>=0.2.12
-faster-whisper>=1.1
-ctranslate2          # motor ASR (dep de faster-whisper; explicito para reproducibilidad)
-numpy>=2.0
+# Dependencias directas de Transcriber.
+#
+# Este archivo declara rangos; para reproducir un build exacto usar el lock:
+#     python build.py --lock          genera requirements.lock.txt
+#     pip install -r requirements.lock.txt
+#
+# Instalacion normal de desarrollo:
+#     python -m venv venv
+#     venv\Scripts\pip install -r requirements.txt
+
+# ── Interfaz ──
+PyQt6>=6.7,<7
+
+# ── Captura de audio (Windows: loopback WASAPI) ──
+PyAudioWPatch>=0.2.12
+
+# ── Transcripcion ──
+faster-whisper>=1.1,<2
+
+# Motor de inferencia. El piso NO es arbitrario:
+#   ctranslate2 4.6.3 fue el primer build con CUDA 12.8, que es el primer toolkit
+#   que emite kernels sm_120 (Blackwell / GeForce RTX 50xx). Con una version
+#   anterior, ctranslate2.get_cuda_device_count() igual devuelve 1 porque eso solo
+#   consulta el driver, y el fallo aparece recien al ejecutar el primer kernel con
+#   "no kernel image is available for execution on the device".
+#   La app degrada sola a CPU en ese caso (hardware.engine_candidates), pero el
+#   usuario perderia la GPU sin motivo.
+#
+#   Ademas ctranslate2 4.6.2 deshabilito INT8 en sm_120: por eso hardware.py usa
+#   float16 en GPU y reserva int8 para CPU. No cambiar eso.
+ctranslate2>=4.6.3,<5
+
+# Estas dos las necesita faster-whisper y hasta ahora entraban solo como
+# dependencias transitivas. Declararlas es lo que garantiza que el empaquetado las
+# incluya (ver Transcriber.spec):
+#   onnxruntime  ejecuta el VAD Silero, que la app aplica en TODA transcripcion.
+#                faster-whisper lo importa de forma perezosa y con try/except, asi
+#                que si falta el error aparece recien en runtime.
+#   av           decodifica el audio de entrada.
+onnxruntime>=1.14,<2
+av>=11
+
+numpy>=2.0,<3
+
+# ── Runtime CUDA (opcional en ejecucion, necesario para empaquetar con GPU) ──
+# Se empaquetan siempre: un unico instalador sirve para cualquier PC porque la app
+# elige GPU o CPU en runtime.
+#
+# IMPORTANTE: estas tres versiones son solidarias con ctranslate2. Los wheels de
+# ctranslate2 para Windows se compilan contra un CUDA y un cuDNN concretos; si se
+# desalinean, el sintoma es "Library cublas64_12.dll is not found or cannot be
+# loaded" en la PC del usuario. Al actualizar ctranslate2, mover las tres juntas y
+# volver a generar el lock.
 nvidia-cublas-cu12
 nvidia-cudnn-cu12
 nvidia-cuda-nvrtc-cu12
+
+# ── Empaquetado ──
+# Se instala sola desde build.py si falta, pero declararla mantiene el lock completo.
+pyinstaller>=6.0
