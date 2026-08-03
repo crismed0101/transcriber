@@ -4,7 +4,7 @@
 
 .DESCRIPTION
     Instala lo que falte (Git, Python, Inno Setup), clona o actualiza el codigo,
-    arma el entorno virtual, compila el instalador y lo verifica.
+    arma el entorno virtual, corre las pruebas, compila el instalador y lo verifica.
 
     Pensado para invocarse en una sola linea:
 
@@ -17,13 +17,15 @@
     Es idempotente: si ya esta todo instalado, solo actualiza el codigo y compila.
     Volver a ejecutarlo despues de cada cambio es lo esperado.
 
+    Compatible con Windows PowerShell 5.1 (el que trae Windows) y con PowerShell 7.
+
 .PARAMETER Run
     No compila: prepara el entorno y abre la app desde el codigo. Es lo mas rapido
     para probar un cambio.
 
 .PARAMETER Publish
     Despues de compilar y verificar, publica el release en GitHub. Requiere `gh`
-    autenticado.
+    autenticado; si no lo esta, el script abre el inicio de sesion.
 
 .PARAMETER Path
     Donde dejar el codigo. Por defecto C:\dev\transcriber.
@@ -42,10 +44,49 @@ function Write-Paso  { param($m) Write-Host "`n==> $m" -ForegroundColor Cyan }
 function Write-Ok    { param($m) Write-Host "    $m" -ForegroundColor Green }
 function Write-Aviso { param($m) Write-Host "    $m" -ForegroundColor Yellow }
 
+function Invoke-Native {
+    <#
+        Ejecuta un programa externo y devuelve su codigo de salida.
+
+        Existe por un comportamiento de Windows PowerShell 5.1: con
+        $ErrorActionPreference = "Stop", CUALQUIER cosa que un programa escriba en
+        la salida de error se vuelve un error fatal, aunque haya terminado bien. Y
+        escriben ahi de forma rutinaria pip (avisos), git (progreso), unittest (los
+        resultados) y PyInstaller.
+
+        Aca se baja la preferencia mientras corre el programa y se decide por el
+        codigo de salida, que es lo unico que de verdad indica si fallo.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$File,
+        [string[]]$Arguments = @(),
+        [switch]$IgnoreExitCode,
+        [string]$ErrorMessage
+    )
+    $previo = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        # La salida se manda a la consola con Write-Host y NO al flujo de la
+        # funcion: si no, quien haga `$x = Invoke-Native ...` recibiria el texto
+        # del programa mezclado con el codigo de salida.
+        # El 2>&1 unifica ambos flujos para que los avisos normales de pip o git no
+        # se vean como errores rojos.
+        & $File @Arguments 2>&1 | ForEach-Object { Write-Host $_ }
+        $codigo = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previo
+    }
+    if (-not $IgnoreExitCode -and $codigo -ne 0) {
+        if ($ErrorMessage) { throw $ErrorMessage }
+        throw "Fallo: $File $($Arguments -join ' ') (codigo $codigo)"
+    }
+    return $codigo
+}
+
 function Update-Path {
-    # winget agrega los programas al PATH del registro, pero la sesion actual
-    # sigue con el PATH viejo. Sin esto habria que cerrar y reabrir PowerShell
-    # entre paso y paso, que es justo lo que este script viene a evitar.
+    # winget agrega los programas al PATH del registro, pero la sesion actual sigue
+    # con el PATH viejo. Sin esto habria que cerrar y reabrir PowerShell entre paso
+    # y paso, que es justo lo que este script viene a evitar.
     $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
                 [Environment]::GetEnvironmentVariable("Path", "User")
 }
@@ -70,7 +111,12 @@ function Install-Tool {
         return
     }
     Write-Ok "Instalando $Name ..."
-    winget install --id $WingetId --silent --accept-source-agreements --accept-package-agreements | Out-Null
+    # winget devuelve codigos distintos de cero en situaciones que no son error
+    # (por ejemplo, "ya estaba instalado"). Lo que decide es el Test de abajo.
+    Invoke-Native -File "winget" -IgnoreExitCode -Arguments @(
+        "install", "--id", $WingetId, "--silent",
+        "--accept-source-agreements", "--accept-package-agreements"
+    ) | Out-Null
     Update-Path
     if (-not (& $Test)) {
         throw "$Name se instalo pero no se lo encuentra. Cerra y volve a abrir PowerShell, y ejecuta el script de nuevo."
@@ -104,11 +150,11 @@ if (-not $Run) {
 }
 if ($Publish) {
     Install-Tool "GitHub CLI" "GitHub.cli" { Test-Tool "gh" }
-    gh auth status 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Aviso "GitHub CLI no esta autenticado. Se va a abrir el inicio de sesion."
-        gh auth login
-        if ($LASTEXITCODE -ne 0) { throw "No se pudo iniciar sesion en GitHub." }
+    $auth = Invoke-Native -File "gh" -Arguments @("auth", "status") -IgnoreExitCode
+    if ($auth -ne 0) {
+        Write-Aviso "GitHub CLI no esta autenticado. Se abre el inicio de sesion."
+        Invoke-Native -File "gh" -Arguments @("auth", "login") `
+                      -ErrorMessage "No se pudo iniciar sesion en GitHub." | Out-Null
     }
     Write-Ok "GitHub CLI autenticado"
 }
@@ -118,48 +164,63 @@ Write-Paso "Obteniendo el codigo"
 if (Test-Path (Join-Path $Path ".git")) {
     Push-Location $Path
     Write-Ok "Ya existe en $Path; actualizando ..."
-    git pull --ff-only
-    if ($LASTEXITCODE -ne 0) {
+    try {
+        Invoke-Native -File "git" -Arguments @("pull", "--ff-only") -ErrorMessage (
+            "No se pudo actualizar el repositorio. Puede que tengas cambios locales " +
+            "sin guardar en $Path.") | Out-Null
+    } catch {
         Pop-Location
-        throw "No se pudo actualizar el repositorio. Revisa si tenes cambios locales sin guardar."
+        throw
     }
 } else {
     if (Test-Path $Path) {
         throw "$Path ya existe y no es un repositorio git. Borralo o elegi otra ruta con -Path."
     }
     Write-Ok "Clonando en $Path ..."
-    git clone --quiet $RepoUrl $Path
-    if ($LASTEXITCODE -ne 0) { throw "No se pudo clonar el repositorio." }
+    Invoke-Native -File "git" -Arguments @("clone", "--quiet", $RepoUrl, $Path) `
+                  -ErrorMessage "No se pudo clonar el repositorio." | Out-Null
     Push-Location $Path
 }
 
 try {
     # version.py no importa nada, asi que se puede leer antes de armar el entorno.
-    $version = (python -c "import version; print(version.__version__)")
+    # Aca hace falta la SALIDA del programa, no su codigo, asi que no se usa
+    # Invoke-Native; se baja la preferencia a mano por el mismo motivo.
+    $previo = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $version = (& python -c "import version; print(version.__version__)")
+    $ErrorActionPreference = $previo
+    if (-not $version) { throw "No se pudo leer la version desde version.py" }
     Write-Ok "Transcriber $version en $Path"
 
     # ── Entorno virtual ──
     Write-Paso "Preparando las dependencias"
-    if (-not (Test-Path "venv\Scripts\python.exe")) {
+    $venvPython = "venv\Scripts\python.exe"
+    if (-not (Test-Path $venvPython)) {
         Write-Ok "Creando el entorno virtual ..."
-        python -m venv venv
-        if ($LASTEXITCODE -ne 0) { throw "No se pudo crear el entorno virtual." }
+        Invoke-Native -File "python" -Arguments @("-m", "venv", "venv") `
+                      -ErrorMessage "No se pudo crear el entorno virtual." | Out-Null
     }
 
     # Comprobar antes de instalar: pip tarda minutos aunque no haya nada que hacer.
-    & "venv\Scripts\python.exe" -c "import PyQt6, faster_whisper, onnxruntime, av" 2>$null
-    if ($LASTEXITCODE -ne 0) {
+    # Que este import falle es lo NORMAL la primera vez, no un error del script.
+    $tiene = Invoke-Native -File $venvPython -IgnoreExitCode `
+                           -Arguments @("-c", "import PyQt6, faster_whisper, onnxruntime, av")
+    if ($tiene -ne 0) {
         Write-Ok "Instalando dependencias (son ~2 GB, puede tardar varios minutos) ..."
-        & "venv\Scripts\python.exe" -m pip install --quiet --upgrade pip
-        & "venv\Scripts\pip.exe" install -r requirements.txt
-        if ($LASTEXITCODE -ne 0) { throw "Fallo la instalacion de dependencias." }
+        Invoke-Native -File $venvPython -IgnoreExitCode `
+                      -Arguments @("-m", "pip", "install", "--quiet", "--upgrade", "pip") | Out-Null
+        Invoke-Native -File "venv\Scripts\pip.exe" `
+                      -Arguments @("install", "-r", "requirements.txt") `
+                      -ErrorMessage "Fallo la instalacion de dependencias." | Out-Null
     }
     Write-Ok "Dependencias listas"
 
     # ── Pruebas ──
     Write-Paso "Corriendo las pruebas"
-    & "venv\Scripts\python.exe" -m unittest discover -s tests -t . 2>&1 | Select-Object -Last 3
-    if ($LASTEXITCODE -ne 0) { throw "Hay pruebas que fallan; no se compila." }
+    Invoke-Native -File $venvPython `
+                  -Arguments @("-m", "unittest", "discover", "-s", "tests", "-t", ".") `
+                  -ErrorMessage "Hay pruebas que fallan; no se compila." | Out-Null
 
     # ── Modo prueba rapida ──
     if ($Run) {
@@ -176,14 +237,17 @@ try {
     # ── Compilacion ──
     Write-Paso "Compilando el instalador"
     Write-Aviso "Esto tarda varios minutos y ocupa unos 3 GB temporales."
-    & "venv\Scripts\python.exe" build.py --clean --installer --strict --lock
-    if ($LASTEXITCODE -ne 0) { throw "Fallo la compilacion." }
+    Invoke-Native -File $venvPython `
+                  -Arguments @("build.py", "--clean", "--installer", "--strict", "--lock") `
+                  -ErrorMessage "Fallo la compilacion." | Out-Null
 
     # ── Verificacion ──
     Write-Paso "Verificando el ejecutable"
-    & "dist\Transcriber\Transcriber.exe" --selftest
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host (Get-Content "$env:LOCALAPPDATA\Transcriber\selftest.log" -ErrorAction SilentlyContinue)
+    $selftest = Invoke-Native -File "dist\Transcriber\Transcriber.exe" `
+                              -Arguments @("--selftest") -IgnoreExitCode
+    if ($selftest -ne 0) {
+        Get-Content "$env:LOCALAPPDATA\Transcriber\selftest.log" -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "    $_" -ForegroundColor Red }
         throw "El ejecutable no paso la verificacion. No se publica nada."
     }
     Write-Ok "El ejecutable funciona"
@@ -191,8 +255,9 @@ try {
     # ── Publicacion ──
     if ($Publish) {
         Write-Paso "Publicando la version $version en GitHub"
-        & "venv\Scripts\python.exe" build.py --publish --strict --skip-ffmpeg
-        if ($LASTEXITCODE -ne 0) { throw "Fallo la publicacion." }
+        Invoke-Native -File $venvPython `
+                      -Arguments @("build.py", "--publish", "--strict", "--skip-ffmpeg") `
+                      -ErrorMessage "Fallo la publicacion." | Out-Null
     }
 
     # ── Resumen ──
@@ -204,7 +269,7 @@ try {
         Write-Host "    Instalador: $($instalador.FullName) ($mb MB)" -ForegroundColor Green
     }
     if ($Publish) {
-        Write-Host "    Publicado en: https://github.com/crismed0101/transcriber/releases/tag/v$version" -ForegroundColor Green
+        Write-Host "    Publicado: https://github.com/crismed0101/transcriber/releases/tag/v$version" -ForegroundColor Green
         Write-Host ""
         Write-Host "    Tus colegas ya pueden instalarlo con:" -ForegroundColor DarkGray
         Write-Host "    irm https://raw.githubusercontent.com/crismed0101/transcriber/master/install.ps1 | iex" -ForegroundColor White
