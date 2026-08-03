@@ -86,7 +86,32 @@ cada tag automáticamente.
 | `Transcriber.iss` | Instalador Inno Setup, por usuario y sin UAC. |
 | `tests/` | Pruebas de las funciones puras (no requieren el stack completo). |
 
-### Setup local (Windows)
+### Todo en un comando
+
+Desde PowerShell en Windows, sin nada instalado previamente:
+
+```powershell
+irm https://raw.githubusercontent.com/crismed0101/transcriber/master/build.ps1 | iex
+```
+
+`build.ps1` instala lo que falte (Git, Python, Inno Setup), clona o actualiza el
+código en `C:\dev\transcriber`, arma el entorno, corre las pruebas, compila el
+instalador y lo verifica con `--selftest`. Es idempotente: volver a ejecutarlo después
+de cada cambio es lo esperado.
+
+Con opciones:
+
+```powershell
+# Solo abrir la app desde el código, sin compilar (lo más rápido para probar)
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/crismed0101/transcriber/master/build.ps1))) -Run
+
+# Compilar y además publicar el release en GitHub
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/crismed0101/transcriber/master/build.ps1))) -Publish
+```
+
+### Setup manual (Windows)
+
+Si preferís controlar cada paso:
 
 ```cmd
 python -m venv venv
@@ -95,7 +120,7 @@ venv\Scripts\pythonw main.py
 ```
 
 Necesitás FFmpeg en el PATH (`winget install Gyan.FFmpeg`) si no hacés el build.
-`start.bat` automatiza todos esos pasos.
+`start.bat` automatiza esos pasos.
 
 ### Pruebas
 
@@ -109,15 +134,13 @@ saneado de nombres, escalera de modelos, numeración de sesiones, limpieza de ca
 ### Empaquetar
 
 El build **debe correr en Windows**: PyInstaller no hace cross-compilation y
-`pyaudiowpatch` es Windows-only. Si desarrollás desde WSL, copiá el árbol a una ruta
-nativa (`C:\dev\transcriber`) antes de compilar; no compiles sobre `\\wsl$\`.
+`pyaudiowpatch` es Windows-only. Si desarrollás desde WSL, no compiles sobre `\\wsl$\`
+(el plano 9p es lento y rompe `os.add_dll_directory`); usá `build.ps1`, que clona a una
+ruta nativa.
+
+Lo que hace por dentro:
 
 ```cmd
-winget install Python.Python.3.12
-winget install JRSoftware.InnoSetup
-
-python -m venv venv
-venv\Scripts\pip install -r requirements.txt
 venv\Scripts\python build.py --clean --installer --strict
 ```
 
